@@ -1,0 +1,225 @@
+/********************************************************************
+ * SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+ * 
+ * Copyright (c) 2023 Rockchip Electronics Co., Ltd.
+ * Copyright (c) 2026 LCKFB <lckfb@sz-jlc.com>
+ *********************************************************************
+ * Wiki-(Chinese)：https://wiki.lckfb.com/
+ * Wiki-(English)：https://wiki.lckfb.com/en/
+ *********************************************************************/
+/dts-v1/;
+
+#include <dt-bindings/usb/pd.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pwm/pwm.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/input/linux-event-codes.h>
+#include <dt-bindings/display/drm_mipi_dsi.h>
+#include <dt-bindings/display/rockchip_vop.h>
+#include <dt-bindings/sensor-dev.h>
+#include "rk3576.dtsi"
+#include "rk3576-rk806.dtsi"
+
+/*-----------------------------------------------------------
+ * Uncomment the required dtsi based on the compiled system type
+ *----------------------------------------------------------*/
+// #include "rk3576-android.dtsi"
+#include "rk3576-linux.dtsi"
+
+/*-----------------------------------------------------------
+ * Core layer configuration, almost no need to modify here, contains basic configurations
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-core.dtsi"
+
+/*-----------------------------------------------------------
+ * Type-C-OTG Configuration
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-typec.dtsi"
+
+/*-----------------------------------------------------------
+ * USB-HOST Configuration
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-usb-host.dtsi"
+
+/*-----------------------------------------------------------
+ * Ethernet Port Configuration
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-eth.dtsi"
+
+/*-----------------------------------------------------------
+ * WIFI-BT Module Configuration, default is AP6256 module
+ * Special Note: Module requires RTC 32KHz clock support, please ensure RTC is started
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-sdio-wifibt.dtsi"
+
+/*-----------------------------------------------------------
+ * HYM8563 RTC Configuration
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-rtc.dtsi"
+
+/*-----------------------------------------------------------
+ * CSI-MIPI Camera Configuration
+ *
+ * TaishanPi 3M RK3576 CSI-MIPI 4-lane camera links in use:
+ *
+ * [sensor0] -> [csi2_dcphy0]->[mipi0_csi2]->[rkcif_mipi_lvds]->[rkcif_mipi_lvds_sditf]->[rkisp_vir0]
+ * [sensor1] -> [csi2_dphy0]->[mipi1_csi2]->[rkcif_mipi_lvds1]->[rkcif_mipi_lvds1_sditf]->[rkisp_vir1]
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-csi0.dtsi"
+#include "tspi-3m-rk3576-csi1.dtsi"
+
+/*-----------------------------------------------------------
+ * Camera Control UART
+ *
+ * HOT_SHOE1 UART_CAM1_RX/TX are routed to UART9_M1:
+ *   UART9_RX_M1: GPIO3_B2
+ *   UART9_TX_M1: GPIO3_B3
+ *
+ * Only RX/TX are enabled. RTS/CTS are intentionally unused.
+ *----------------------------------------------------------*/
+&uart9 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart9m1_xfer>;
+	status = "okay";
+};
+
+
+/*-----------------------------------------------------------
+ * MINI-PCIe Configuration
+ *
+ * The MINI-PCIe slot supports three mutually exclusive modes.
+ * There are two ways to activate a mode — choose ONE method only:
+ *
+ * Method A: Static (baked into the kernel image)
+ *   Uncomment exactly one #include below, then recompile the kernel.
+ *   This is the recommended approach for production images.
+ *
+ * Method B: Dynamic (device tree overlay, no recompile needed)
+ *   Keep all #includes commented out, then edit /boot/ubootEnv.txt
+ *   on the board and add one of the following lines, then reboot:
+ *     overlays=tspi-3m-minipcie-pcie.dtbo
+ *     overlays=tspi-3m-minipcie-sata.dtbo
+ *     overlays=tspi-3m-minipcie-ec20.dtbo
+ *   Overlay source files are in device-tree-overlays/overlays/.
+ *
+ * WARNING: Do NOT use both methods for the same mode simultaneously.
+ *   If a #include is active AND its corresponding overlay is loaded,
+ *   regulator/device nodes will be duplicated and the kernel will
+ *   fail to boot correctly.
+ *----------------------------------------------------------*/
+// #include "tspi-3m-rk3576-pcie.dtsi"
+// #include "tspi-3m-rk3576-sata.dtsi"
+// #include "tspi-3m-rk3576-ec20-4g.dtsi"
+
+/*-----------------------------------------------------------
+ * Headphone Interface and Onboard Microphone Configuration
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-headset-onboard-mic.dtsi"
+
+/*-----------------------------------------------------------
+ * Display Interface Configuration (HDMI & DP & MIPI)
+ * HDMI  : tspi-3m-rk3576-hdmi.dtsi
+ * DP    : tspi-3m-rk3576-dp.dtsi
+ * MIPI  : Choose different dtsi files according to different screens
+ *
+ * general file configuration exists for compatibility with device tree overlay mechanism
+ * [Special Note]: RK3576 has limited vp path resources
+ * Default configuration: HDMI is set to vp0, DP is set to vp1, MIPI-DSI is set to vp2
+ *----------------------------------------------------------*/
+#include "tspi-3m-rk3576-hdmi.dtsi"
+#include "tspi-3m-rk3576-dp.dtsi"
+#include "tspi-3m-rk3576-dsi-general.dtsi"
+
+/*
+ * Product Model: LCKFB-TSPI-10.1inch-MIPI-TP
+ * Screen Name: LCSC-boards LCKFB-TSPI-10.1inch-MIPI-TP
+ * Screen Resolution: 800x1280
+ * LCSC Part Number: C41409463
+ */
+// #include "tspi-3m-rk3576-dsi-c41409463.dtsi"
+
+/*
+ * Product Model: LCKFB-mipi-3.1inch-screen
+ * Screen Name: LCSC-boards LCKFB-mipi-3.1inch-screen
+ * Screen Resolution: 480x800
+ * LCSC Part Number: C42388916
+ */
+// #include "tspi-3m-rk3576-dsi-c42388916.dtsi"
+
+/*-----------------------------------------------------------
+ * Board Basic Information Configuration
+ *----------------------------------------------------------*/
+/ {
+	model = "LCKFB TaishanPi 3M RK3576 Board";
+	compatible = "lckfb,tspi-3m-rk3576", "rockchip,rk3576";
+
+	/*
+	 * User LED
+	 * Used to indicate system status
+	 */
+	leds: leds {
+		status = "okay";
+		compatible = "gpio-leds";
+
+		work_led: work {
+			linux,default-trigger = "heartbeat";
+			gpios = <&gpio0 RK_PA0 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * Board Cooling Fan Configuration
+	 */
+	fan: pwm-fan {
+		status = "okay";
+		compatible = "pwm-fan";
+
+		#cooling-cells = <2>;
+
+		pwms = <&pwm2_8ch_3 0 500000 0>;
+		cooling-levels = <0 100 150 200 255>;
+		rockchip,temp-trips = <
+			0        0
+			35000    1
+			45000    2
+			55000    3
+			65000    4
+		>;
+	};
+};
+
+/*-----------------------------------------------------------
+ * pwm fan channel setting
+ *-----------------------------------------------------------*/
+&pwm2_8ch_3 {
+	status = "okay";
+	pinctrl-0 = <&pwm2m3_ch3>;
+};
+
+/*-----------------------------------------------------------
+ * Board sleep settings
+ *-----------------------------------------------------------*/
+&rockchip_suspend {
+	status = "okay";
+
+	/*
+	 *	Sleep log debug enable
+	 *	0: Disable
+	 *	1: Enable
+	 */
+	rockchip,sleep-debug-en = <1>;
+
+	/*
+	 *	IO retention configuration
+	 *
+	 *	In sleep scenarios where vdd_logic is powered off
+	 *	Maintain the level of RKPM_VCCIO3_RET_EN IO.
+	 */
+	rockchip,sleep-io-ret-config = <
+		(0
+		| RKPM_VCCIO3_RET_EN
+		)
+	>;
+
+	rockchip,regulator-on-before-mem = <&vdd_npu_s0>;
+};

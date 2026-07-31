@@ -1,0 +1,129 @@
+CC ?= gcc
+CXX ?= g++
+CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
+CXXFLAGS ?= -O2 -Wall -Wextra -Wpedantic -std=c++17
+CPPFLAGS ?=
+LDFLAGS ?=
+LDLIBS ?=
+
+APP_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+SDK_ROOT := $(abspath $(APP_DIR)/../..)
+RKAIQ_ROOT ?= /usr
+MPP_ROOT ?= $(RKAIQ_ROOT)
+UVC_ROOT := $(SDK_ROOT)/external/uvc_app/uvc
+
+CPPFLAGS += -DUSE_NEWSTRUCT=1 -isystem $(RKAIQ_ROOT)/include/rkaiq
+CPPFLAGS += -I$(UVC_ROOT) -isystem $(MPP_ROOT)/include/rockchip
+ifneq ($(strip $(TOOLCHAIN_LIBC_LIB)),)
+TOOLCHAIN_LIBC_USR_LIB := $(abspath $(TOOLCHAIN_LIBC_LIB)/../usr/lib64)
+LDFLAGS += -L$(TOOLCHAIN_LIBC_USR_LIB)
+LDFLAGS += -L$(TOOLCHAIN_LIBC_LIB)
+LDFLAGS += -Wl,-rpath-link,$(TOOLCHAIN_LIBC_USR_LIB)
+LDFLAGS += -Wl,-rpath-link,$(TOOLCHAIN_LIBC_LIB)
+endif
+LDFLAGS += -L$(RKAIQ_ROOT)/lib
+LDFLAGS += -L$(MPP_ROOT)/lib/aarch64-linux-gnu
+LDFLAGS += -Wl,-rpath-link,$(RKAIQ_ROOT)/lib
+LDFLAGS += -Wl,-rpath-link,$(RKAIQ_ROOT)/lib/aarch64-linux-gnu
+LDFLAGS += -Wl,--allow-shlib-undefined
+LDLIBS += -lrkaiq -lrockchip_mpp -lpthread -ldl
+
+TARGETS := camera_aiq_test
+UVC_OBJECTS := rkuvc_gadget.o rkuvc_video.o rkuvc_yuv.o \
+	rkuvc_control.o rkuvc_encode.o rkuvc_uevent.o
+OBJECTS := camera_aiq_test.o camera_backend.o capture_backend.o \
+	camera_uvc_backend.o camera_net_backend.o camera_photo_backend.o \
+	photo_exif.o xvs_uart_controller.o \
+	trigger_frame_binder.o trigger_simulator.o \
+	$(UVC_OBJECTS)
+
+CROSS_CC := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc
+CROSS_CXX := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++
+CROSS_RKAIQ_ROOT := $(SDK_ROOT)/ubuntu/binary/usr
+CROSS_LIBC_LIB := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu/libc/lib64
+
+.PHONY: all aarch64 check check-xvs-uart check-stage6-host clean
+
+all: $(TARGETS)
+
+camera_aiq_test: $(OBJECTS)
+	$(CXX) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+camera_aiq_test.o: camera_aiq_test.cpp camera_backend.h capture_backend.h \
+	camera_uvc_backend.h camera_net_backend.h xvs_uart_controller.h \
+	camera_photo_backend.h photo_exif.h trigger_frame_binder.h trigger_simulator.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+camera_backend.o: camera_backend.cpp camera_backend.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+capture_backend.o: capture_backend.cpp capture_backend.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+camera_uvc_backend.o: camera_uvc_backend.cpp camera_uvc_backend.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+camera_net_backend.o: camera_net_backend.cpp camera_net_backend.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+camera_photo_backend.o: camera_photo_backend.cpp camera_photo_backend.h photo_exif.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+photo_exif.o: photo_exif.cpp photo_exif.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+xvs_uart_controller.o: xvs_uart_controller.cpp xvs_uart_controller.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+trigger_frame_binder.o: trigger_frame_binder.cpp trigger_frame_binder.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+trigger_simulator.o: trigger_simulator.cpp trigger_simulator.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+rkuvc_gadget.o: $(UVC_ROOT)/uvc-gadget.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+rkuvc_video.o: $(UVC_ROOT)/uvc_video.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+rkuvc_yuv.o: $(UVC_ROOT)/yuv.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+rkuvc_control.o: $(UVC_ROOT)/uvc_control.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+rkuvc_encode.o: $(UVC_ROOT)/uvc_encode.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+rkuvc_uevent.o: $(UVC_ROOT)/uevent.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+aarch64:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) \
+		CC=$(CROSS_CC) CXX=$(CROSS_CXX) \
+		RKAIQ_ROOT=$(CROSS_RKAIQ_ROOT) MPP_ROOT=$(CROSS_RKAIQ_ROOT) \
+		TOOLCHAIN_LIBC_LIB=$(CROSS_LIBC_LIB) all
+
+check: camera_aiq_test
+	./camera_aiq_test --help
+	./camera_aiq_test --sync-bind-self-test
+	./camera_aiq_test --photo-exif-self-test
+
+check-xvs-uart:
+	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
+		xvs_uart_controller.cpp xvs_uart_controller_test.cpp \
+		-lutil -lpthread -o xvs_uart_controller_test
+	./xvs_uart_controller_test
+
+stage6_host_test: stage6_host_test.cpp photo_exif.cpp photo_exif.h \
+	trigger_frame_binder.cpp trigger_frame_binder.h
+	$(CXX) $(CXXFLAGS) stage6_host_test.cpp photo_exif.cpp \
+		trigger_frame_binder.cpp -lpthread -o $@
+
+check-stage6-host: stage6_host_test
+	./stage6_host_test
+
+clean:
+	$(RM) $(TARGETS) $(OBJECTS) xvs_uart_controller_test stage6_host_test

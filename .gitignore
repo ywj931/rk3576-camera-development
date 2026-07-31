@@ -1,0 +1,16 @@
+*.o
+*.a
+*.so
+*.pyc
+*.log
+*.raw
+*.nv12
+*.mjpeg
+*.mkv
+*.img
+*.tar.gz
+__pycache__/
+backups/
+captures/
+test_results/
+output/

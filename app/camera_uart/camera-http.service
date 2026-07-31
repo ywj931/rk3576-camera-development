@@ -1,0 +1,16 @@
+[Unit]
+Description=RK3576 dual-camera HTTP MJPEG service
+After=network.target rkaiq_3A.service
+Conflicts=rkaiq_3A.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/camera_uart
+ExecStart=/root/camera_uart/camera_aiq_test --daemon
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

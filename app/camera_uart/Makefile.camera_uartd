@@ -1,0 +1,26 @@
+CC ?= gcc
+CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
+HOST_CC ?= gcc
+
+APP_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+SDK_ROOT := $(abspath $(APP_DIR)/../..)
+CROSS_CC := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc
+
+.PHONY: all aarch64 check clean
+
+all: camera_uartd
+
+camera_uartd: camera_uartd.c
+	$(CC) $(CFLAGS) $< -o $@
+
+aarch64:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) CC=$(CROSS_CC) all
+
+check:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) CC=$(HOST_CC) all
+	./camera_uartd --self-test
+
+clean:
+	$(RM) camera_uartd

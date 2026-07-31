@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="gitea_origin" fetch="http://100.66.1.2:3000/TaishanPi-3-Linux"/>
+  
+  <project name="android.rk.platform.system.rk_tee_user" path="external/security/rk_tee_user" remote="gitea_origin" revision="150493459a0c8a57eb7bda49b19b11679ede7f0f" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="android.rk.u-boot" path="u-boot" remote="gitea_origin" revision="54aee35aa01e45e65d180231689b543746861eeb" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.app.lvgl_demo" path="app/lvgl_demo" remote="gitea_origin" revision="55a4f3de0171b81938b39c4571dee51867b7208c" upstream="master" dest-branch="master"/>
+  <project name="linux.app.rkipc" path="app/rkipc" remote="gitea_origin" revision="26e189a6a0931efe9337da4cd0c32dd94fc25ba1" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.app.rkpartybox" path="app/rkpartybox" remote="gitea_origin" revision="4480de522ad8f0439049c5d2e3b8db9005ad3266" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.app.web-new.ipcweb-backend" path="app/ipcweb-backend" remote="gitea_origin" revision="ff48b90bb8938c62cecbf68cead4c6f69b68dd3a" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.bsp.docs" path="docs" remote="gitea_origin" revision="0a6e41b790db306dc5f99102125c468a87747c78" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.bsp.docs" path="docs/cn" remote="gitea_origin" revision="0a6e41b790db306dc5f99102125c468a87747c78" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="Rockchip_Developer_Guide_Linux_Software_CN.pdf" dest="docs/cn/RK3576/Rockchip_Developer_Guide_Linux_Software_CN.pdf"/>
+  </project>
+  <project name="linux.bsp.docs" path="docs/en" remote="gitea_origin" revision="0a6e41b790db306dc5f99102125c468a87747c78" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="Rockchip_Developer_Guide_Linux_Software_EN.pdf" dest="docs/en/RK3576/Rockchip_Developer_Guide_Linux_Software_EN.pdf"/>
+  </project>
+  <project name="linux.bsp.internal_doc" path="docs/cn/RK3576" remote="gitea_origin" revision="3ecbbe4e616777878d89c024c4f71709b0888bc8" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.bsp.internal_doc" path="docs/en/RK3576" remote="gitea_origin" revision="3ecbbe4e616777878d89c024c4f71709b0888bc8" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.bsp.rkadk" path="app/rkadk" remote="gitea_origin" revision="6cdc8799f7dde11578f5b0e153d31f8f4c40d595" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.build" path="yocto/build/conf" remote="gitea_origin" revision="680abdfc787ee8af8029f460f884f37c563e42bf" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.buildroot" path="buildroot" remote="gitea_origin" revision="8c544b5239f162ac999328c5d01602d0f09295fc" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="build/envsetup.sh" dest="envsetup.sh"/>
+  </project>
+  <project name="linux.debian" path="debian" remote="gitea_origin" revision="97f65c9ebd39c79df27184e640dc8a78feaa5900" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.device.rockchip" path="device/rockchip" remote="gitea_origin" revision="484d41eda731e4ed2334641d31a115912ec5fb21" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="common/scripts/build.sh" dest="build.sh"/>
+    <linkfile src="common/Makefile" dest="Makefile"/>
+    <linkfile src="common/scripts/rkflash.sh" dest="rkflash.sh"/>
+  </project>
+  <project name="linux.drm-cursor" path="external/drm-cursor" remote="gitea_origin" revision="23cebd5dd33a3073f296533954d4c211481891ab" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.alsa-config" path="external/alsa-config" remote="gitea_origin" revision="5529257039c41955724c1069796f5cb7b2015c77" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.camera_engine_rkaiq" path="external/camera_engine_rkaiq" remote="gitea_origin" revision="818fb8a474779aea74d3b99cd8c3fd88e118dbc0" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.chromium" path="external/chromium" remote="gitea_origin" revision="71d83a8d3a1027135ce1b4ecd439885e61eb578a" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.common_algorithm" path="external/common_algorithm" remote="gitea_origin" revision="888fa60a16eee5b690a23de3437f926610947108" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.dpdk" path="external/dpdk" remote="gitea_origin" revision="77b6da771bdd80d5dad8f484994d2a44306ae7a1" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.minilogger" path="external/minilogger" remote="gitea_origin" revision="5f0fa4698d5305d8653c2352bfcf1d9aa57064a4" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rk_ethercat_release" path="external/rk_ethercat_release" remote="gitea_origin" revision="f34748f01b4241c745272a990ef697011f88b92d" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rk_pcba_test" path="external/rk_pcba_test" remote="gitea_origin" revision="9ca36b2bf70f2f164b1891f1ac1ce2bf8eb9325c" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rkscript" path="external/rkscript" remote="gitea_origin" revision="28a65621b0c0f1ccfad9d4ee600c0a035ed21956" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rktoolkit" path="external/rktoolkit" remote="gitea_origin" revision="bc1d85d6d2a39c67ed2d619f6faf1a996d542722" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rkupdate" path="external/rkupdate" remote="gitea_origin" revision="e9cd4fe07733f807057fd7a6bd5e8d42a59624a7" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rkwifibt" path="external/rkwifibt" remote="gitea_origin" revision="4233bd7e0f174367f8e1a0c5932a8c3c7e1fc4a6" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rkwifibt-app" path="external/rkwifibt-app" remote="gitea_origin" revision="0673a0b73af5b2027ea7e3631fcd610f45941cee" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.rockit_uvc" path="external/rockit_uvc" remote="gitea_origin" revision="250289ba0e2e752d2dbf93c884911a774cb60784" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.uac_app" path="external/uac_app" remote="gitea_origin" revision="434c2d15193589fd9960eb910c76333ab3446675" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.external.uvc_app" path="external/uvc_app" remote="gitea_origin" revision="2974d251b0df0f28fdbfe1c9c8a319aa03833320" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.gstreamer-rockchip" path="external/gstreamer-rockchip" remote="gitea_origin" revision="ca829e0dc1d814df01711a5796e7510812af9e85" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.ipc.media.avs" path="external/avs" remote="gitea_origin" revision="ba1c01ac5a5eb75644b6320bf05cc637494d773f" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.ipc.media.iva" path="external/iva" remote="gitea_origin" revision="edfa2c5dab7cffcf8a35731c4cb7ed9c090b0dec" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.ipc.media.samples" path="external/samples" remote="gitea_origin" revision="ab8c25ca65638af62d0842f4f328531e9992e581" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.libmali" path="external/libmali" remote="gitea_origin" revision="c36874bc419f72cd9971a613fe31366b3ebde77e" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.linux-rga" path="external/linux-rga" remote="gitea_origin" revision="396a26666974a4c90e785be93b9b0efd40a941c8" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.poky" path="yocto/poky" remote="gitea_origin" revision="0b37512fb4b231cc106768e2a7328431009b3b70" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="scripts" dest="yocto/scripts"/>
+    <linkfile src="bitbake" dest="yocto/bitbake"/>
+    <linkfile src="meta-poky" dest="yocto/meta-poky"/>
+    <linkfile src=".templateconf" dest="yocto/.templateconf"/>
+    <linkfile src="oe-init-build-env" dest="yocto/oe-init-build-env"/>
+  </project>
+  <project name="linux.recovery" path="external/recovery" remote="gitea_origin" revision="7edb5d5a73d8e9dacbb52ba0b547175c222f4f8a" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.rkfsmk" path="external/rkfsmk" remote="gitea_origin" revision="31ef4a6a53b461d8e145020d89480c42f375f2b3" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.rockchip-test" path="external/rockchip-test" remote="gitea_origin" revision="eb2093cb6f891cf073ab0b4af08b4189f6a12b8a" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.rockit" path="external/rockit" remote="gitea_origin" revision="6e1d68c4199595e5181d24785e63cbbaeb5ddd04" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="." dest="rtos/bsp/rockchip/common/drivers/rockit"/>
+  </project>
+  <project name="linux.security.bin" path="external/security/bin" remote="gitea_origin" revision="20850d7254231628101b3925e9fb3b0e8abefce1" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.tools" path="tools" remote="gitea_origin" revision="7d36257dd4f28fe6107421fac47b2b39a1c7e305" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.ubuntu" path="ubuntu" remote="gitea_origin" revision="4318480a63b34abdcf50e1a6e03d9589c8cc9bd1" upstream="main" dest-branch="main" clone-depth="1"/>
+  <project name="linux.xserver" path="external/xserver" remote="gitea_origin" revision="5a535e26142d5a580436bbbd7ba502cab77cf367" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.yocto.meta-browser" path="yocto/meta-browser" remote="gitea_origin" revision="83cb90c618e24af9bc40fb25baab2a0acd47a560" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.yocto.meta-clang" path="yocto/meta-clang" remote="gitea_origin" revision="52c61cd5d447f871a1666e64fcfdf5f27a47f44c" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.yocto.meta-openembedded" path="yocto/meta-openembedded" remote="gitea_origin" revision="2338409efc51cf2022ff5610a9fb689251706e2b" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="linux.yocto.meta-rockchip" path="yocto/meta-rockchip" remote="gitea_origin" revision="f250fd15069a9946a9a2a327d12f72c2a260d8cf" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.kernel-stable" path="kernel-6.1" remote="gitea_origin" revision="21988c91bebd4dbf041022e37808cb1af54d72a0" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="." dest="kernel"/>
+  </project>
+  <project name="rk.librkcrypto" path="external/security/librkcrypto" remote="gitea_origin" revision="df05511fa6c22c02ce1940b03bdc1596bc4e27b9" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.mcu.hal" path="hal" remote="gitea_origin" revision="6be055a7cedadef0ee2900e5cdabec4e96d71e7c" upstream="master" dest-branch="master" clone-depth="1">
+    <linkfile src="." dest="rtos/bsp/rockchip/common/hal"/>
+  </project>
+  <project name="rk.mcu.hal.applications" path="hal/applications" remote="gitea_origin" revision="c6ca24e6478303965118f77f67522ce993b1d18b" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.mcu.hal.board" path="hal/board" remote="gitea_origin" revision="4d869c06821a09190c062b638c08225879677c02" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.mcu.hal.middleware" path="hal/middleware" remote="gitea_origin" revision="d6c07c70e592376585f96e92518f17631bda3155" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.mcu.hal.test" path="hal/test" remote="gitea_origin" revision="5070900fe93fc65fcddd0f3140055efe7bb6b36e" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.mpp" path="external/mpp" remote="gitea_origin" revision="ab796560522c767b610ef1ef7930a73d2f8c77eb" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.prebuilts.arm-gnu-toolchain-13.2.rel1-x86_64-aarch64-none-elf" path="prebuilts/gcc/linux-x86/aarch64/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf" remote="gitea_origin" revision="1e202616ec808c067834e8f1e3c2237c22b8375b" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.prebuilts.gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu" path="prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu" remote="gitea_origin" revision="adbb295a970c4b39dc487c95226fe84d2c460072" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.prebuilts.gcc-arm-10.3-2021.07-x86_64-arm-none-linux-gnueabihf" path="prebuilts/gcc/linux-x86/arm/gcc-arm-10.3-2021.07-x86_64-arm-none-linux-gnueabihf" remote="gitea_origin" revision="2e89382ca3f8c34086272509ae4d7a5c340ffafc" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.prebuilts.gcc-arm-none-eabi-10-2020-q4-major-x86_64-linux" path="prebuilts/gcc/linux-x86/arm/gcc-arm-none-eabi-10-2020-q4-major-x86_64-linux" remote="gitea_origin" revision="fc433f3a59487127ca416be069df82de82c422c0" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.rkbin" path="rkbin" remote="gitea_origin" revision="2c1be1054e86338285309ecc20fa61fc15fd5437" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.rknn-toolkit2" path="external/rknn-toolkit2" remote="gitea_origin" revision="960e9e6b5e5e6edf786fa2453f9b2bb367de296e" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rk.rknpu2" path="external/rknpu2" remote="gitea_origin" revision="e25488bea88a859cb903e1adc575467fa4685f16" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rtos.rt-thread.docs" path="docs/rtt-docs" remote="gitea_origin" revision="7d286e5fe595b68f460b2c1c055092b9cb499f5b" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rtos.rt-thread.rt-thread" path="rtos" remote="gitea_origin" revision="d8da5af086d3e566df242f83e49b608c02cc05b6" upstream="master" dest-branch="master" clone-depth="1"/>
+  <project name="rtos.rt-thread.rtthread-apps" path="rtos/applications/rtthread-apps" remote="gitea_origin" revision="de57ff3af30c2689d3a7f1d89032e064af7b3597" upstream="master" dest-branch="master" clone-depth="1"/>
+</manifest>

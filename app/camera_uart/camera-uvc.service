@@ -1,0 +1,18 @@
+[Unit]
+Description=RK3576 dual-camera UVC output
+After=usbdevice.service
+Requires=usbdevice.service
+Conflicts=camera-http.service rkaiq_3A.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/camera_uart
+Environment=UVC_CNT=2
+ExecStart=/root/camera_uart/camera_aiq_test --uvc-daemon
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
