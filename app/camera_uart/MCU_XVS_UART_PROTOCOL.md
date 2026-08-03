@@ -28,6 +28,8 @@ MCU 上电后必须立即把 XVS 配为推挽高电平。板上 `FSYNC_CAM` 有�
 
 ## 3. UART 参数和帧格式
 
+- RK3576 与 MCU 之间只有一条全双工 UART，即 `/dev/ttyS9`。相机控制、XVS
+  控制应答和时间事件都在这条链路上传输，不需要第二个 UART。
 - 115200 baud、8 数据位、无校验、1 停止位、无流控。
 - ASCII，一帧以 `\r\n` 结束。
 - CRC 为 CRC16-CCITT-FALSE：初值 `0xffff`，多项式 `0x1021`，不反射，
@@ -118,11 +120,15 @@ $EVT,XVS,<trigger_id>,<pps_id>,<timer_tick>*<CRC16>\r\n
 先确认没有其他程序占用 ttyS9，例如 `camera_uartd`。启动同一个程序：
 
 ```sh
-./camera_aiq_test --sync-uart /dev/ttyS9
+./camera_aiq_test --uart /dev/ttyS9 --sync-timer-hz 1000000
 ```
 
 启动时程序会依次执行 `PING` 和 `IDLE`。任何一步超时、CRC 错误或收到
 NACK，程序都会拒绝进入控制台，避免在 MCU 状态未知时开始采集。
+
+同一接收线程按报文前缀分流：MCU 发来的 `$CAM` 进入相机命令队列，带 CRC 的
+`$ACK/$NACK` 唤醒对应 `$XVS` 事务，`$EVT` 进入 PPS/NMEA/Trigger 时间链。
+MCU 必须串行发送完整帧，不能让两个任务逐字节交叉写 UART。
 
 交互命令：
 

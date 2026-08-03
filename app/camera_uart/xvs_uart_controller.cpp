@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <mutex>
 #include <new>
@@ -16,12 +17,15 @@
 #include <termios.h>
 #include <thread>
 #include <time.h>
+#include <utility>
 #include <unistd.h>
 
 namespace {
 
 constexpr int kResponseTimeoutMs = 1500;
-constexpr size_t kFrameMax = 512;
+constexpr size_t kFrameMax = 1024;
+constexpr size_t kControlQueueMax = 32;
+constexpr size_t kControlResponseMax = 16384;
 
 struct ParsedResponse {
     bool ack = false;
@@ -304,8 +308,10 @@ struct xvs_uart_controller {
     std::string device;
     std::atomic<bool> stop_reader{false};
     std::thread reader_thread;
+    std::thread control_thread;
 
     std::mutex command_mutex;
+    std::mutex write_mutex;
     uint32_t next_sequence = 1;
     std::mutex response_mutex;
     std::condition_variable response_condition;
@@ -318,6 +324,12 @@ struct xvs_uart_controller {
     std::mutex callback_mutex;
     xvs_uart_event_callback_t event_callback = nullptr;
     void *event_user_data = nullptr;
+
+    std::mutex control_mutex;
+    std::condition_variable control_condition;
+    std::deque<std::string> control_queue;
+    xvs_uart_control_callback_t control_callback = nullptr;
+    void *control_user_data = nullptr;
 };
 
 namespace {
@@ -330,8 +342,67 @@ void set_reader_error(xvs_uart_controller_t *controller, int result)
     controller->response_condition.notify_all();
 }
 
+void control_main(xvs_uart_controller_t *controller)
+{
+    for (;;) {
+        std::string request;
+        xvs_uart_control_callback_t callback = nullptr;
+        void *user_data = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(controller->control_mutex);
+            controller->control_condition.wait(lock, [&] {
+                return controller->stop_reader.load() ||
+                       !controller->control_queue.empty();
+            });
+            if (controller->stop_reader.load()) {
+                return;
+            }
+            request = std::move(controller->control_queue.front());
+            controller->control_queue.pop_front();
+            callback = controller->control_callback;
+            user_data = controller->control_user_data;
+        }
+        if (!callback)
+            continue;
+
+        char response[kControlResponseMax] = {};
+        size_t response_size = 0;
+        const int callback_result = callback(
+            request.c_str(), response, sizeof(response), &response_size,
+            user_data);
+        if (callback_result != XVS_UART_OK ||
+            response_size > sizeof(response)) {
+            set_reader_error(controller, XVS_UART_ERR_PROTOCOL);
+            return;
+        }
+        if (!response_size)
+            continue;
+        int write_result = XVS_UART_OK;
+        {
+            std::lock_guard<std::mutex> lock(controller->write_mutex);
+            write_result = write_all(controller->fd, response, response_size);
+            if (write_result == XVS_UART_OK && tcdrain(controller->fd) < 0)
+                write_result = XVS_UART_ERR_IO;
+        }
+        if (write_result != XVS_UART_OK) {
+            set_reader_error(controller, write_result);
+            return;
+        }
+    }
+}
+
 void dispatch_line(xvs_uart_controller_t *controller, const std::string &line)
 {
+    if (line.compare(0, 5, "$CAM,") == 0) {
+        std::lock_guard<std::mutex> lock(controller->control_mutex);
+        if (controller->control_callback &&
+            controller->control_queue.size() < kControlQueueMax) {
+            controller->control_queue.push_back(line);
+            controller->control_condition.notify_one();
+        }
+        return;
+    }
+
     ParsedResponse response;
     if (parse_response(line, &response)) {
         std::lock_guard<std::mutex> lock(controller->response_mutex);
@@ -426,9 +497,13 @@ int transact(xvs_uart_controller_t *controller, const std::string &command,
 
     const std::string request = add_crc_and_terminator(
         "XVS," + std::to_string(sequence) + "," + command);
-    int result = write_all(controller->fd, request.data(), request.size());
-    if (result == XVS_UART_OK && tcdrain(controller->fd) < 0)
-        result = XVS_UART_ERR_IO;
+    int result = XVS_UART_OK;
+    {
+        std::lock_guard<std::mutex> lock(controller->write_mutex);
+        result = write_all(controller->fd, request.data(), request.size());
+        if (result == XVS_UART_OK && tcdrain(controller->fd) < 0)
+            result = XVS_UART_ERR_IO;
+    }
     if (result != XVS_UART_OK) {
         std::lock_guard<std::mutex> lock(controller->response_mutex);
         controller->response_waiting = false;
@@ -496,7 +571,12 @@ extern "C" int xvs_uart_create(const char *device,
     controller->saved_valid = true;
     try {
         controller->reader_thread = std::thread(reader_main, controller);
+        controller->control_thread = std::thread(control_main, controller);
     } catch (...) {
+        controller->stop_reader.store(true);
+        controller->control_condition.notify_all();
+        if (controller->reader_thread.joinable())
+            controller->reader_thread.join();
         tcsetattr(controller->fd, TCSANOW, &controller->saved);
         close(controller->fd);
         delete controller;
@@ -512,8 +592,11 @@ extern "C" void xvs_uart_destroy(xvs_uart_controller_t *controller)
         return;
     controller->stop_reader.store(true);
     controller->response_condition.notify_all();
+    controller->control_condition.notify_all();
     if (controller->reader_thread.joinable())
         controller->reader_thread.join();
+    if (controller->control_thread.joinable())
+        controller->control_thread.join();
     if (controller->fd >= 0) {
         if (controller->saved_valid)
             tcsetattr(controller->fd, TCSANOW, &controller->saved);
@@ -531,6 +614,18 @@ extern "C" int xvs_uart_set_event_callback(
     std::lock_guard<std::mutex> lock(controller->callback_mutex);
     controller->event_callback = callback;
     controller->event_user_data = user_data;
+    return XVS_UART_OK;
+}
+
+extern "C" int xvs_uart_set_control_callback(
+    xvs_uart_controller_t *controller, xvs_uart_control_callback_t callback,
+    void *user_data)
+{
+    if (!controller)
+        return XVS_UART_ERR_ARGUMENT;
+    std::lock_guard<std::mutex> lock(controller->control_mutex);
+    controller->control_callback = callback;
+    controller->control_user_data = user_data;
     return XVS_UART_OK;
 }
 

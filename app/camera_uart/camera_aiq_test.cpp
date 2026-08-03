@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -111,9 +112,10 @@ void print_usage(const char *program)
         << "  --autostart         start capture and HTTP output for both cameras\n"
         << "  --daemon            autostart both cameras and run without console input\n"
         << "  --uvc-daemon        start both cameras and two UVC outputs without console input\n"
-        << "  --control-uart DEVICE  receive camera/output commands (115200 8N1)\n"
+        << "  --uart DEVICE      unified camera control, XVS and time-event UART (recommended)\n"
+        << "  --control-uart DEVICE  legacy separate camera control UART\n"
         << "  --control-uart-protocol-self-test  test control protocol without hardware\n"
-        << "  --sync-uart DEVICE  MCU XVS control UART (115200 8N1)\n"
+        << "  --sync-uart DEVICE  legacy separate MCU XVS/time-event UART\n"
         << "  --sync-timer-hz HZ  MCU high-resolution timer frequency (default: 1000000)\n"
         << "  --sync-protocol-self-test  test XVS protocol without camera hardware\n"
         << "  --sync-bind-self-test  test simulated trigger/frame binding without camera hardware\n"
@@ -1643,6 +1645,51 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
     return true;
 }
 
+struct unified_uart_control_context {
+    camera_backend_t *backend = nullptr;
+    capture_backend_t *capture = nullptr;
+    camera_uvc_backend_t *uvc = nullptr;
+    camera_net_backend_t *net = nullptr;
+    camera_photo_backend_t *photo = nullptr;
+    xvs_uart_controller_t *xvs = nullptr;
+    time_sync_service_t *time_sync = nullptr;
+    trigger_frame_binder_t *binder = nullptr;
+    trigger_simulator_t *simulator = nullptr;
+    std::mutex command_mutex;
+};
+
+int process_unified_uart_control(const char *request, char *response,
+                                 size_t response_capacity,
+                                 size_t *response_size, void *user_data)
+{
+    auto *context = static_cast<unified_uart_control_context *>(user_data);
+    if (!request || !response || !response_size || !context)
+        return XVS_UART_ERR_ARGUMENT;
+
+    std::string framed_response;
+    const auto handler = [&](const std::string &command, std::string *output) {
+        std::lock_guard<std::mutex> lock(context->command_mutex);
+        std::ostringstream captured;
+        std::streambuf *saved = std::cout.rdbuf(captured.rdbuf());
+        execute_command(context->backend, context->capture, context->uvc,
+                        context->net, context->photo, context->xvs,
+                        context->time_sync, context->binder,
+                        context->simulator, command);
+        std::cout.flush();
+        std::cout.rdbuf(saved);
+        *output = captured.str();
+    };
+    const int result =
+        camera_control_uart::process_frame(request, handler, &framed_response);
+    if (result != camera_control_uart::OK)
+        return XVS_UART_ERR_PROTOCOL;
+    if (framed_response.size() > response_capacity)
+        return XVS_UART_ERR_IO;
+    std::memcpy(response, framed_response.data(), framed_response.size());
+    *response_size = framed_response.size();
+    return XVS_UART_OK;
+}
+
 bool autostart_http_outputs(capture_backend_t *capture,
                             camera_net_backend_t *net)
 {
@@ -1736,6 +1783,7 @@ int main(int argc, char **argv)
     bool sync_bind_self_test = false;
     bool photo_exif_self_test = false;
     bool control_uart_protocol_self_test = false;
+    std::string unified_uart_device;
     std::string sync_uart_device;
     std::string control_uart_device;
 
@@ -1811,6 +1859,8 @@ int main(int argc, char **argv)
             expected_sensors[camera_id] = value;
             config.expected_sensor[camera_id] =
                 expected_sensors[camera_id].c_str();
+        } else if (option == "--uart") {
+            unified_uart_device = value;
         } else if (option == "--sync-uart") {
             sync_uart_device = value;
         } else if (option == "--sync-timer-hz") {
@@ -1829,6 +1879,21 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
     }
+
+    if (!unified_uart_device.empty()) {
+        if ((!sync_uart_device.empty() &&
+             sync_uart_device != unified_uart_device) ||
+            (!control_uart_device.empty() &&
+             control_uart_device != unified_uart_device)) {
+            std::cerr << "UART_CONFIGURATION_FAILED reason=\"--uart cannot "
+                         "be combined with a different legacy UART device\"\n";
+            return EXIT_FAILURE;
+        }
+        sync_uart_device = unified_uart_device;
+        control_uart_device = unified_uart_device;
+    }
+    const bool shared_uart = !sync_uart_device.empty() &&
+                             sync_uart_device == control_uart_device;
 
     if (sync_protocol_self_test) {
         const int protocol_result = xvs_uart_protocol_self_test();
@@ -1868,15 +1933,6 @@ int main(int argc, char **argv)
         std::cout << "CONTROL_UART_PROTOCOL_SELF_TEST_OK detail=\""
                   << report << "\"\n";
         return EXIT_SUCCESS;
-    }
-
-    if (!control_uart_device.empty() &&
-        control_uart_device == sync_uart_device) {
-        std::cerr << "UART_CONFIGURATION_FAILED reason=\"control UART and "
-                     "XVS command UART cannot independently own the same "
-                     "device\" device=\""
-                  << control_uart_device << "\"\n";
-        return EXIT_FAILURE;
     }
 
     std::signal(SIGINT, signal_handler);
@@ -2043,12 +2099,25 @@ int main(int argc, char **argv)
     xvs_event_context xvs_events;
     xvs_events.time_sync = time_sync;
     xvs_events.binder = binder;
+    unified_uart_control_context unified_control;
+    unified_control.backend = backend;
+    unified_control.capture = capture;
+    unified_control.uvc = uvc;
+    unified_control.net = net;
+    unified_control.photo = photo;
+    unified_control.time_sync = time_sync;
+    unified_control.binder = binder;
+    unified_control.simulator = simulator;
     xvs_uart_controller_t *xvs = nullptr;
     if (!sync_uart_device.empty()) {
         result = xvs_uart_create(sync_uart_device.c_str(), &xvs);
+        unified_control.xvs = xvs;
         if (result == XVS_UART_OK)
             result = xvs_uart_set_event_callback(
                 xvs, xvs_event_to_time_and_frame, &xvs_events);
+        if (result == XVS_UART_OK && shared_uart)
+            result = xvs_uart_set_control_callback(
+                xvs, process_unified_uart_control, &unified_control);
         if (result == XVS_UART_OK)
             result = xvs_uart_ping(xvs);
         if (result == XVS_UART_OK)
@@ -2073,6 +2142,11 @@ int main(int argc, char **argv)
                   << "\" baud=115200 format=8N1 output_state=IDLE_HIGH"
                   << " timer_frequency_hz="
                   << time_sync_config.timer_frequency_hz << '\n';
+        if (shared_uart) {
+            std::cout << "UART_MUX_READY device=\"" << sync_uart_device
+                      << "\" baud=115200 format=8N1"
+                      << " routes=CAM,XVS_ACK,PPS_NMEA_TRIGGER\n";
+        }
     }
 
     std::cout << "CAMERA_BACKEND_READY cameras=" << CAMERA_BACKEND_CAMERA_COUNT
@@ -2109,7 +2183,30 @@ int main(int argc, char **argv)
     }
 
     int runtime_result = EXIT_SUCCESS;
-    if (!control_uart_device.empty()) {
+    const auto run_console = [&] {
+        const bool interactive = isatty(STDIN_FILENO);
+        std::string line;
+        while (!g_stop) {
+            if (interactive)
+                std::cout << "camera-aiq> " << std::flush;
+            if (!std::getline(std::cin, line))
+                break;
+            if (!execute_command(backend, capture, uvc, net, photo, xvs,
+                                 time_sync, binder, simulator, line))
+                break;
+        }
+    };
+    if (shared_uart) {
+        std::cout << "CONTROL_UART_READY device=\"" << control_uart_device
+                  << "\" baud=115200 format=8N1 protocol=CAM_V1"
+                  << " owner=UART_MUX\n";
+        if (daemon_mode) {
+            while (!g_stop)
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        } else {
+            run_console();
+        }
+    } else if (!control_uart_device.empty()) {
         std::cout << "CONTROL_UART_READY device=\"" << control_uart_device
                   << "\" baud=115200 format=8N1 protocol=CAM_V1\n";
         const auto handler = [&](const std::string &command,
@@ -2136,20 +2233,9 @@ int main(int argc, char **argv)
         while (!g_stop)
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
     } else {
-        const bool interactive = isatty(STDIN_FILENO);
-        std::string line;
-        while (!g_stop) {
-            if (interactive)
-                std::cout << "camera-aiq> " << std::flush;
-            if (!std::getline(std::cin, line))
-                break;
-            if (!execute_command(backend, capture, uvc, net, photo, xvs,
-                                 time_sync, binder, simulator, line))
-                break;
-        }
+        run_console();
     }
 
-    trigger_simulator_destroy(simulator);
     if (xvs) {
         const int stop_result = xvs_uart_stop(xvs);
         if (stop_result != XVS_UART_OK) {
@@ -2159,6 +2245,7 @@ int main(int argc, char **argv)
         }
         xvs_uart_destroy(xvs);
     }
+    trigger_simulator_destroy(simulator);
     capture_backend_destroy(capture);
     trigger_frame_binder_destroy(binder);
     time_sync_destroy(time_sync);

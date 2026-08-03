@@ -123,7 +123,8 @@ check: camera_aiq_test
 
 check-xvs-uart:
 	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
-		xvs_uart_controller.cpp xvs_uart_controller_test.cpp \
+		xvs_uart_controller.cpp camera_control_uart.cpp \
+		xvs_uart_controller_test.cpp \
 		-lutil -lpthread -o xvs_uart_controller_test
 	./xvs_uart_controller_test
 

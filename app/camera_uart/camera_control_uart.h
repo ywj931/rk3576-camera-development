@@ -22,6 +22,8 @@ using stop_requested = std::function<bool()>;
 
 int run(const std::string &device, const command_handler &handler,
         const stop_requested &should_stop);
+int process_frame(const std::string &frame, const command_handler &handler,
+                  std::string *response);
 int protocol_self_test(std::string *report);
 const char *strerror(int value);
 

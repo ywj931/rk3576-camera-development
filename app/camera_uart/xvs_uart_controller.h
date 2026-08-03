@@ -1,6 +1,7 @@
 #ifndef XVS_UART_CONTROLLER_H
 #define XVS_UART_CONTROLLER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -55,6 +56,9 @@ typedef struct xvs_uart_event {
 
 typedef void (*xvs_uart_event_callback_t)(const xvs_uart_event_t *event,
                                           void *user_data);
+typedef int (*xvs_uart_control_callback_t)(
+    const char *request, char *response, size_t response_capacity,
+    size_t *response_size, void *user_data);
 
 int xvs_uart_create(const char *device, xvs_uart_controller_t **controller_out);
 void xvs_uart_destroy(xvs_uart_controller_t *controller);
@@ -72,6 +76,9 @@ int xvs_uart_get_status(xvs_uart_controller_t *controller,
 int xvs_uart_set_event_callback(xvs_uart_controller_t *controller,
                                 xvs_uart_event_callback_t callback,
                                 void *user_data);
+int xvs_uart_set_control_callback(xvs_uart_controller_t *controller,
+                                  xvs_uart_control_callback_t callback,
+                                  void *user_data);
 
 int xvs_uart_protocol_self_test(void);
 const char *xvs_uart_strerror(int result);

@@ -310,8 +310,8 @@ int translate(const request &input, std::string *command,
     return OK;
 }
 
-std::string process_frame(const std::string &line,
-                          const command_handler &handler)
+std::string process_frame_impl(const std::string &line,
+                               const command_handler &handler)
 {
     request parsed;
     std::string reason;
@@ -433,7 +433,7 @@ int run(const std::string &device, const command_handler &handler,
                 if (discarding) {
                     response = nack(0, kGlobalCameraId, "FRAME_TOO_LONG");
                 } else if (!frame.empty()) {
-                    response = process_frame(frame, handler);
+                    response = process_frame_impl(frame, handler);
                 }
                 frame.clear();
                 discarding = false;
@@ -460,6 +460,15 @@ int run(const std::string &device, const command_handler &handler,
     flock(fd, LOCK_UN);
     close(fd);
     return result_value;
+}
+
+int process_frame(const std::string &frame, const command_handler &handler,
+                  std::string *response)
+{
+    if (frame.empty() || !handler || !response)
+        return ERR_ARGUMENT;
+    *response = process_frame_impl(frame, handler);
+    return OK;
 }
 
 int protocol_self_test(std::string *report)
@@ -511,8 +520,9 @@ int protocol_self_test(std::string *report)
                       ? "UVC_STATUS camera_id=0 enabled=1\n"
                       : "ERROR command=test reason=failed\n";
     };
-    const std::string ack = process_frame("$CAM,11,0,UVC_STATUS", handler);
-    const std::string error = process_frame("$CAM,12,0,NET_STATUS", handler);
+    const std::string ack = process_frame_impl("$CAM,11,0,UVC_STATUS", handler);
+    const std::string error =
+        process_frame_impl("$CAM,12,0,NET_STATUS", handler);
     if (ack.find("$ACK,11,0,UVC_STATUS,") != 0 ||
         error.find("$NACK,12,0,NET_STATUS,") != 0) {
         if (report)

@@ -52,7 +52,7 @@ event_utc_ns = pps_utc_ns
 程序默认 MCU 计数器频率为 1 MHz，可通过以下参数修改：
 
 ```bash
-./camera_aiq_test --sync-uart /dev/ttyS9 --sync-timer-hz 1000000
+./camera_aiq_test --uart /dev/ttyS9 --sync-timer-hz 1000000
 ```
 
 RK3576 收到 UART 字节时的 `CLOCK_MONOTONIC` 时间只用于诊断串口延迟，不能当作
@@ -83,7 +83,7 @@ $EVT,XVS,<trigger_id>,<pps_id>,<timer_tick>*<CRC16>\r\n
 
 ```bash
 cd /root/camera_uart
-./camera_aiq_test --sync-uart /dev/ttyS9 --sync-timer-hz 1000000
+./camera_aiq_test --uart /dev/ttyS9 --sync-timer-hz 1000000
 ```
 
 程序内执行：
@@ -182,7 +182,7 @@ stream-stop all
 5. 标定 `trigger_time -> exposure_start/exposure_center` 的 sensor 固定延迟。
 6. 将曝光/增益改为与具体 frame_id 绑定的传感器或 ISP metadata。
 
-另外，当前 `--control-uart` 和 `--sync-uart` 是两个独立串口所有者，不能同时打开
-同一个 `/dev/ttyS9`。如果最终 MCU 只提供一根 UART 并同时承载 `$CAM`、`$XVS`
-和 `$EVT`，需要合并为一个 UART 多路复用接收器；如果控制与同步使用两个物理 UART，
-现有结构可直接使用。
+软件侧的一 UART 多路复用已经完成：`--uart /dev/ttyS9` 只打开一次设备，并统一
+分流 `$CAM`、`$XVS` 的 ACK/NACK 和 `$EVT`。伪终端测试已覆盖控制命令执行期间
+嵌套发起 `$XVS STATUS` 的场景，确认接收线程不会死锁。真实 MCU、电平、PPS、XVS
+和 1000 次物理触发仍属于上述硬件闭环验收，软件模拟通过不能替代它们。

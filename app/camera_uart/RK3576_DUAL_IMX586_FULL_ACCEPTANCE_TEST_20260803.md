@@ -749,7 +749,7 @@ cd /root/camera_uart
 通过标志：
 
 ```text
-CONTROL_UART_PROTOCOL_SELF_TEST_OK detail="cases=12"
+CONTROL_UART_PROTOCOL_SELF_TEST_OK detail="cases=14 pty=115200_8N1_ACK"
 ```
 
 开发电脑源码目录还可以执行：
@@ -759,7 +759,7 @@ cd /home/ywj/rk3576_sdk/TaishanPi-3-Linux/app/camera_uart
 make -f Makefile.camera_aiq check-control-uart-host
 ```
 
-本次软件测试 12 个协议用例均通过，包括 115200、8N1 伪终端收发和 ACK。它不证明实际 TX/RX 引脚、电平转换或 MCU 程序正确。
+本次软件测试 14 个协议用例均通过，包括 115200、8N1 伪终端收发和 ACK。它不证明实际 TX/RX 引脚、电平转换或 MCU 程序正确。
 
 ### 14.2 实际接线
 
@@ -909,7 +909,7 @@ quit
 systemctl stop camera-uvc.service
 systemctl stop camera-http.service 2>/dev/null || true
 cd /root/camera_uart
-./camera_aiq_test --sync-uart /dev/ttyS9
+./camera_aiq_test --uart /dev/ttyS9 --sync-timer-hz 1000000
 ```
 
 在提示符输入 4 Hz 测试：
@@ -939,11 +939,12 @@ stream-stop all
 - 示波器同时测 `FSYNC_CAM`、`PPS_OUT`、cam0 XVS 和 cam1 XVS，得到最大值和 P99 同步偏差；
 - trigger_id 和两路 frame_id 一一对应，无重复、无漏绑。
 
-### 16.4 当前 UART 架构限制
+### 16.4 单 UART 架构
 
-`--control-uart /dev/ttyS9` 是外部对端控制 RK3576，`--sync-uart /dev/ttyS9` 是 RK3576 控制 MCU 产生 XVS。两个独立串口对象不能同时打开同一个 `/dev/ttyS9`。
-
-如果最终只有一个 MCU、一个 UART，同时承担相机命令和 XVS/PPS/NMEA，必须把两套消息合并到一个双向收发线程中统一分流。当前软件自测通过不代表这个最终集成已经完成。
+最终只有一个 MCU、一个 `/dev/ttyS9`。使用 `--uart /dev/ttyS9` 后，程序只打开
+一次串口并统一处理相机命令、XVS 控制应答、PPS/NMEA/Trigger 事件。主机伪终端
+已经验证三类消息交错和控制命令嵌套查询 XVS 不死锁；真实引脚、电平和 MCU
+固件仍必须按本章完成上板验收。
 
 ---
 

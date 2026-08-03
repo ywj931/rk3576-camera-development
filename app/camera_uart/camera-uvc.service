@@ -8,7 +8,7 @@ Conflicts=camera-http.service rkaiq_3A.service
 Type=simple
 WorkingDirectory=/root/camera_uart
 Environment=UVC_CNT=2
-ExecStart=/root/camera_uart/camera_aiq_test --uvc-daemon --control-uart /dev/ttyS9
+ExecStart=/root/camera_uart/camera_aiq_test --uvc-daemon --uart /dev/ttyS9 --sync-timer-hz 1000000
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM

@@ -1,7 +1,9 @@
 #include "xvs_uart_controller.h"
+#include "camera_control_uart.h"
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,7 +93,8 @@ bool write_all(int fd, const std::string &data)
     return true;
 }
 
-void mock_mcu(int master_fd, std::atomic<bool> *failed)
+void mock_mcu(int master_fd, std::atomic<bool> *failed,
+              std::atomic<bool> *control_response_seen)
 {
     std::string frame;
     std::string state = "IDLE";
@@ -118,6 +121,12 @@ void mock_mcu(int master_fd, std::atomic<bool> *failed)
             continue;
         }
 
+        if (frame.rfind("$ACK,77,255,SYNC_STATUS,", 0) == 0) {
+            control_response_seen->store(true);
+            frame.clear();
+            continue;
+        }
+
         std::string payload;
         const std::vector<std::string> fields =
             checked_payload(frame, &payload) ? split(payload)
@@ -132,7 +141,8 @@ void mock_mcu(int master_fd, std::atomic<bool> *failed)
         const std::string &command = fields[2];
         std::string response;
         if (command == "PING" && fields.size() == 3) {
-            if (!write_all(master_fd,
+            if (!write_all(master_fd, "$CAM,77,255,SYNC_STATUS\r\n") ||
+                !write_all(master_fd,
                            make_frame("EVT,PPS,10,10000000"))) {
                 *failed = true;
                 break;
@@ -212,6 +222,45 @@ struct EventCounters {
     std::atomic<uint64_t> last_trigger_id{0};
 };
 
+struct ControlContext {
+    xvs_uart_controller_t *controller = nullptr;
+    std::atomic<uint32_t> calls{0};
+};
+
+int on_control(const char *request, char *response, size_t response_capacity,
+               size_t *response_size, void *user_data)
+{
+    auto *context = static_cast<ControlContext *>(user_data);
+    if (!request || !response || !response_size || !context) {
+        return XVS_UART_ERR_PROTOCOL;
+    }
+    int command_result = XVS_UART_ERR_PROTOCOL;
+    std::string reply;
+    const int parse_result = camera_control_uart::process_frame(
+        request,
+        [&](const std::string &command, std::string *output) {
+            if (command != "sync-status")
+                return;
+            xvs_uart_status_t status = {};
+            command_result =
+                xvs_uart_get_status(context->controller, &status);
+            if (command_result == XVS_UART_OK)
+                *output = "SYNC_CONTROLLER_STATUS state=" +
+                          std::string(status.state);
+        },
+        &reply);
+    if (parse_result != camera_control_uart::OK ||
+        command_result != XVS_UART_OK) {
+        return command_result;
+    }
+    if (reply.size() > response_capacity)
+        return XVS_UART_ERR_IO;
+    std::memcpy(response, reply.data(), reply.size());
+    *response_size = reply.size();
+    ++context->calls;
+    return XVS_UART_OK;
+}
+
 void on_event(const xvs_uart_event_t *event, void *user_data)
 {
     EventCounters *counters = static_cast<EventCounters *>(user_data);
@@ -246,15 +295,24 @@ int main()
     close(slave_fd);
 
     std::atomic<bool> mock_failed(false);
-    std::thread mock(mock_mcu, master_fd, &mock_failed);
+    std::atomic<bool> control_response_seen(false);
+    std::thread mock(mock_mcu, master_fd, &mock_failed,
+                     &control_response_seen);
 
     xvs_uart_controller_t *controller = nullptr;
     EventCounters events;
+    ControlContext control;
     bool success = expect_ok("create", xvs_uart_create(slave_name, &controller));
+    control.controller = controller;
     success = success && expect_ok(
                              "set event callback",
                              xvs_uart_set_event_callback(controller, on_event,
                                                          &events));
+    success = success && expect_ok(
+                             "set control callback",
+                             xvs_uart_set_control_callback(controller,
+                                                           on_control,
+                                                           &control));
     success = success && expect_ok("ping", xvs_uart_ping(controller));
     success = success && expect_ok("idle", xvs_uart_idle(controller));
     success = success && expect_ok("start", xvs_uart_start(controller, 4, 10));
@@ -282,6 +340,12 @@ int main()
     success = success && events.pps.load() == 2 && events.rmc.load() == 1 &&
               events.nmea.load() == 1 && events.xvs.load() == 1 &&
               events.last_trigger_id.load() == 101;
+    for (int attempt = 0; attempt < 100 && !control_response_seen.load();
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    success = success && control.calls.load() == 1 &&
+              control_response_seen.load();
 
     xvs_uart_destroy(controller);
     close(master_fd);
@@ -292,6 +356,7 @@ int main()
         std::fprintf(stderr, "XVS_UART_MOCK_TEST_FAILED\n");
         return EXIT_FAILURE;
     }
-    std::printf("XVS_UART_MOCK_TEST_OK async_events=PPS,RMC,NMEA,XVS\n");
+    std::printf("XVS_UART_MOCK_TEST_OK one_uart_mux=CAM,XVS_ACK,EVT "
+                "nested_xvs_command=OK async_events=PPS,RMC,NMEA,XVS\n");
     return EXIT_SUCCESS;
 }

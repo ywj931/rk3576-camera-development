@@ -8,9 +8,9 @@
 - cam0/cam1 两路独立 4000x3000@10fps MJPEG UVC 输出；
 - cam0/cam1 两路独立 4000x3000@10fps HTTP MJPEG 网络输出；
 - 曝光、模拟增益、帧率、开始/停止出流、开始/停止保存和状态查询命令；
-- `/dev/ttyS9` 115200、8N1 相机/输出控制入口；
-- 可选的 MCU UART XVS 控制、PPS/GPRMC UTC 对时，以及 trigger 与双路
-  frame_id 绑定。
+- 一条 `/dev/ttyS9` 115200、8N1 全双工链路，统一承载相机控制、MCU XVS
+  命令/应答、PPS/GPRMC/Trigger 事件；
+- PPS/GPRMC UTC 对时，以及 trigger 与双路 frame_id 绑定。
 
 UVC 将 camera0、camera1 分别输出到 `uvc.0`、`uvc.1`，依赖 USB gadget 按
 `DUAL_UVC_4000X3000_TEST_20260731.md` 配置。
@@ -29,7 +29,8 @@ IMX586 已经在同一触发沿曝光。模拟与 MCU 迁移说明见
 - `trigger_simulator.h/.cpp`：不产生物理 XVS 的 2 Hz/4 Hz 应用层模拟触发源。
 - `time_sync_service.h/.cpp`：解析 RMC，将下一 PPS 锁定到 UTC，并把 MCU
   计数器时间换算为 UTC 纳秒。
-- `xvs_uart_controller.h/.cpp`：统一接收 XVS 命令应答和 PPS/RMC/XVS 异步事件。
+- `xvs_uart_controller.h/.cpp`：唯一的 UART 所有者，统一分流 `$CAM`、XVS
+  命令应答和 PPS/RMC/XVS 异步事件。
 - `camera_control_uart.h/.cpp`：UART 帧解析、命令映射和 ACK/NACK 返回。
 - `camera_aiq_test.cpp`：统一的本地命令和 UART 命令入口。
 - `Makefile.camera_aiq`：板卡原生构建和 SDK 交叉构建，只输出 `camera_aiq_test`。
@@ -90,26 +91,29 @@ make -f Makefile.camera_aiq aarch64
 `http://<board-ip>:8080/cam1`，或用 `http://<board-ip>:8080/` 同时查看两路。
 开机常驻配置和协议说明见 `NETWORK_HTTP_MJPEG.md`。
 
-双路 UVC 并从 UART 接收控制命令时运行：
+双路 UVC 并连接最终 MCU 时运行：
 
 ```sh
-./camera_aiq_test --uvc-daemon --control-uart /dev/ttyS9
+./camera_aiq_test --uvc-daemon --uart /dev/ttyS9 --sync-timer-hz 1000000
 ```
 
 该模式已经写入 `camera-uvc.service`。服务启动后，一个进程同时持有两路相机、
 两路 UVC、网络和保存后端；UART 命令不会再启动第二个相机程序。
 
-连接提供 PPS、NMEA 和 XVS 事件的 MCU 时运行：
+不启动 UVC、只进入控制台联调同一个 MCU 时运行：
 
 ```sh
-./camera_aiq_test --sync-uart /dev/ttyS9 --sync-timer-hz 1000000
+./camera_aiq_test --uart /dev/ttyS9 --sync-timer-hz 1000000
 ```
 
-`--sync-timer-hz` 必须等于 MCU 上报 `timer_tick` 的实际计数频率。当前
-`--control-uart` 和 `--sync-uart` 是两个独立串口角色，不能同时打开同一个设备；
-只有一条 UART 物理链路时，本版本应选择 `--sync-uart` 完成 PPS/XVS 时间链，
-普通相机控制先使用本地控制台。将两类协议复用到一条 UART 属于 MCU 接入时的
-后续接口整合项。
+`--sync-timer-hz` 必须等于 MCU 上报 `timer_tick` 的实际计数频率。`--uart` 是推荐
+参数：程序只打开一次 `/dev/ttyS9`，接收线程按 `$CAM`、带 CRC 的 `$ACK/$NACK`
+和 `$EVT` 分流。相机控制在独立工作线程执行，因此 `$CAM ... SYNC_START` 可以继续
+通过同一串口发送 `$XVS` 并等待 MCU 应答，不会阻塞接收线程。
+
+`--control-uart`、`--sync-uart` 仅保留给旧脚本或确实有两路物理 UART 的产品。
+当前没有 MCU、只验证相机控制时仍可单独使用 `--control-uart /dev/ttyS9`；接入
+最终 MCU 后必须改用 `--uart /dev/ttyS9`。
 
 ## 本地命令
 

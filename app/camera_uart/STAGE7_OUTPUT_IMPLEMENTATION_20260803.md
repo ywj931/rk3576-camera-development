@@ -73,17 +73,16 @@ $CAM,13,1,FPS,10
 成功返回 `$ACK`，语法错误、状态错误或后端失败返回 `$NACK`。命令的完整输出放在
 最后一个百分号编码字段内，避免状态文本中的逗号和换行破坏 UART 帧边界。
 
-注意：当前 `--control-uart` 是 MCU/上位机到 RK3576 的相机控制入口，
-`--sync-uart` 是 RK3576 到 MCU 的 XVS 脉冲控制入口。不能用两个独立串口对象同时
-打开同一个 `/dev/ttyS9`。后期同一 MCU 同时承担两种功能时，应把 XVS 命令/事件
-并入本双向协议，由一个 UART 收发线程统一分流。
+最终接口只有一个 `/dev/ttyS9`。使用 `--uart /dev/ttyS9` 时，一个 UART 接收线程
+统一分流 `$CAM`、带 CRC 的 XVS ACK/NACK 和 `$EVT`；相机命令由独立工作线程执行，
+可以在处理 `SYNC_START` 时通过同一串口继续与 MCU 事务通信。
 
 ## 4. 开机运行方式
 
 `camera-uvc.service` 已配置为：
 
 ```text
-/root/camera_uart/camera_aiq_test --uvc-daemon --control-uart /dev/ttyS9
+/root/camera_uart/camera_aiq_test --uvc-daemon --uart /dev/ttyS9 --sync-timer-hz 1000000
 ```
 
 它自动启动两路采集和两个 UVC 输出，然后等待 UART 命令。网络和 eMMC 可随后按
@@ -110,6 +109,7 @@ journalctl -u camera-uvc.service -n 100 --no-pager
 ```text
 UVC_AUTOSTART_READY cameras=0,1 outputs=2 mode=4000x3000@10fps/MJPEG
 CONTROL_UART_READY device="/dev/ttyS9" baud=115200 format=8N1 protocol=CAM_V1
+UART_MUX_READY device="/dev/ttyS9" baud=115200 format=8N1 routes=CAM,XVS_ACK,PPS_NMEA_TRIGGER
 ```
 
 UART 依次测试 PING、两路状态、分别停止/启动 UVC、分别启动/停止网络和保存。
@@ -167,7 +167,7 @@ SHA-256: 4f344e04072799327057f0277ef37d56dfe99dca71aedea6c0f52792bda115b6
 本次已经完成：
 
 - AArch64 交叉编译通过；电脑端 UART 解析、伪终端 115200/8N1 收发和 ACK 测试
-  通过，合计 12 个协议用例。
+  通过，合计 14 个相机协议用例。
 - 板端 `--control-uart-protocol-self-test` 通过；正式服务成功独占打开
   `/dev/ttyS9`，日志出现 `CONTROL_UART_READY`。
 - 正式服务识别 `uvc.0`、`uvc.1`，板端节点为 `/dev/video49`、
@@ -180,8 +180,9 @@ SHA-256: 4f344e04072799327057f0277ef37d56dfe99dca71aedea6c0f52792bda115b6
 - eMMC 独立保存路径、NV12 文件和 CSV 创建成功：cam0 保存 41 帧、
   738,000,000 字节，cam1 保存 33 帧、594,000,000 字节；无写文件失败。
   测试产生的 1.3 GiB 临时原始文件已清理。
-- 测试结束后已恢复并启用 `camera-uvc.service`，实际启动参数为
-  `--uvc-daemon --control-uart /dev/ttyS9`。
+- 当时测试结束后恢复的旧服务参数为
+  `--uvc-daemon --control-uart /dev/ttyS9`；统一 UART 版本改为
+  `--uvc-daemon --uart /dev/ttyS9 --sync-timer-hz 1000000`，需接入 MCU 后上板回归。
 
 本次尚未完成的最终硬件验收：
 
