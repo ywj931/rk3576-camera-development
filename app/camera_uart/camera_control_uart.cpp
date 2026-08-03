@@ -297,6 +297,12 @@ int translate(const request &input, std::string *command,
     } else if (input.operation == "SYNC_STATUS") {
         if (!require_global() || !require_arguments(0)) return ERR_PROTOCOL;
         *command = "sync-status";
+    } else if (input.operation == "TIME_STATUS") {
+        if (!require_global() || !require_arguments(0)) return ERR_PROTOCOL;
+        *command = "time-sync-status";
+    } else if (input.operation == "TIME_RESET") {
+        if (!require_global() || !require_arguments(0)) return ERR_PROTOCOL;
+        *command = "time-sync-reset";
     } else {
         *reason = "UNKNOWN_COMMAND";
         return ERR_PROTOCOL;
@@ -472,8 +478,10 @@ int protocol_self_test(std::string *report)
         {"$CAM,6,0,EXPOSURE,30000", "exposure 0 30000", true},
         {"$CAM,7,1,GAIN,8000", "gain 1 8000", true},
         {"$CAM,8,255,SYNC_START,2,10", "sync-start 2 10", true},
-        {"$CAM,9,255,SAVE_START,/tmp/bad", "", false},
-        {"$CAM,10,7,UVC_START", "", false},
+        {"$CAM,9,255,TIME_STATUS", "time-sync-status", true},
+        {"$CAM,10,255,TIME_RESET", "time-sync-reset", true},
+        {"$CAM,11,255,SAVE_START,/tmp/bad", "", false},
+        {"$CAM,12,7,UVC_START", "", false},
     };
 
     size_t passed = 0;

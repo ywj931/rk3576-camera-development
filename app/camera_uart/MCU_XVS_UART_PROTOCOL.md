@@ -75,6 +75,25 @@ PULSE_COUNT=1000,LAST_TRIGGER_ID=1000
 已输出下降沿加一。ACK 表示命令已经被 MCU 接受；定量输出是否完成要查询
 `STATE`，完成后必须回到 `IDLE` 并保持高电平。
 
+MCU 还必须主动上报异步事件。事件和 ACK/NACK 共用同一串口，均使用相同的
+CRC16 和行结束符：
+
+```text
+$EVT,PPS,<pps_id>,<timer_tick>*<CRC16>\r\n
+$EVT,NMEA,<pps_id>,<$GNRMC...*HH>*<CRC16>\r\n
+$EVT,RMC,<pps_id>,<utc_sec>,<valid>*<CRC16>\r\n
+$EVT,XVS,<trigger_id>,<pps_id>,<timer_tick>*<CRC16>\r\n
+```
+
+`NMEA` 和已经解析成 Unix 秒的 `RMC` 二选一即可，推荐 MCU 原样转发 `NMEA`，
+由 RK3576 校验 NMEA XOR checksum、状态位和日期。`NMEA` 事件有内层 `*HH`
+和外层 `*CRC16`，外层 CRC 从 `EVT` 算到内层 checksum 末尾。
+
+`PPS.timer_tick` 和 `XVS.timer_tick` 必须来自同一个不复位的 MCU 高精度硬件
+计数器。禁止使用 UART 发送时刻代替边沿锁存时间；串口有排队延迟和调度抖动。
+`pps_id`、`trigger_id` 必须单调递增，MCU 重启后 RK3576 需执行
+`time-sync-reset` 和 `sync-bind-reset`。
+
 ## 4. MCU 固件要求
 
 不要用 UART 中断里的延时或主循环翻转 GPIO。使用硬件定时器/PWM：
@@ -82,6 +101,11 @@ PULSE_COUNT=1000,LAST_TRIGGER_ID=1000
 - 4 Hz：周期 250000 us，低电平 10 us，高电平 249990 us。
 - 2 Hz：周期 500000 us，低电平 10 us，高电平 499990 us。
 - 下降沿定义为一个新的 `trigger_id`。
+- 捕获 GNSS PPS 有效边沿时锁存高精度计数器，递增 `pps_id` 并上报 `EVT,PPS`。
+- PPS 后到达的 GPRMC/GNRMC 报文必须带上刚才的 `pps_id`；下一 PPS 的 UTC
+  定义为该 RMC 秒时间加 1 秒。
+- 产生每个 XVS 下降沿时，在同一个计数器域内锁存 `timer_tick`，上报
+  `EVT,XVS`；不能先发送报文再用软件时间估计边沿。
 - `COUNT` 用定时器更新中断计数，在最后一个脉冲结束后关闭定时器并拉高。
 - `STOP`、`IDLE`、复位和错误恢复都必须关闭定时器并主动拉高。
 - CRC 错误、非法频率、非法脉宽不得改变当前输出，返回 NACK。
@@ -104,6 +128,7 @@ NACK，程序都会拒绝进入控制台，避免在 MCU 状态未知时开始�
 
 ```text
 sync-controller-status
+time-sync-status
 stream-start all
 sync-start 4
 sync-status
@@ -135,10 +160,21 @@ stream-stop all
 ISP/V4L2 缓冲时间差，只能辅助诊断。最终曝光起点误差仍需示波器同时观察
 `FSYNC_CAM`、`PPS_OUT`、cam0 pin26 和 cam1 pin26。
 
+开始保存带 UTC 的照片前，必须先看到：
+
+```text
+TIME_SYNC_STATUS state=UTC_LOCKED utc_valid=1
+```
+
+详细的 PPS/GPRMC/Trigger/frame_id/EXIF 数据链和验收边界见
+`STAGE7_PPS_NMEA_TRIGGER_TIME_20260803.md`。
+
 ## 6. 本机无 MCU 测试
 
 ```sh
 make -f Makefile.camera_aiq check-xvs-uart
+make -f Makefile.camera_aiq check-time-sync
+make -f Makefile.camera_aiq check-stage7-host
 ```
 
 该测试使用伪终端模拟 MCU，覆盖 115200 串口打开、CRC、序号、PING、IDLE、

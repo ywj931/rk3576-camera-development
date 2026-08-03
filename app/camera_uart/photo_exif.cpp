@@ -75,15 +75,19 @@ std::string user_comment(const Metadata &metadata)
         text, sizeof(text),
         "camera_id=%d;frame_id=%u;trigger_id=%llu;"
         "trigger_monotonic_ns=%llu;trigger_realtime_ns=%llu;"
+        "pps_id=%llu;trigger_timer_tick=%llu;"
         "frame_monotonic_ns=%llu;frame_realtime_ns=%llu;"
         "exposure_start_realtime_ns=%llu;exposure_center_realtime_ns=%llu;"
         "exposure_us=%u;gain_x1000=%u;iso=%u;iso_estimated=%d;"
         "sensor_response_offset_ns=%lld;trigger_to_frame_ns=%lld;"
-        "utc_valid=%d;trigger_source=%s;exposure_source=%s",
+        "utc_valid=%d;trigger_monotonic_is_uart_arrival=%d;"
+        "trigger_source=%s;exposure_source=%s",
         metadata.camera_id, metadata.frame_id,
         static_cast<unsigned long long>(metadata.trigger_id),
         static_cast<unsigned long long>(metadata.trigger_monotonic_ns),
         static_cast<unsigned long long>(metadata.trigger_realtime_ns),
+        static_cast<unsigned long long>(metadata.pps_id),
+        static_cast<unsigned long long>(metadata.trigger_timer_tick),
         static_cast<unsigned long long>(metadata.frame_monotonic_ns),
         static_cast<unsigned long long>(metadata.frame_realtime_ns),
         static_cast<unsigned long long>(metadata.exposure_start_realtime_ns),
@@ -92,7 +96,9 @@ std::string user_comment(const Metadata &metadata)
         metadata.iso_estimated ? 1 : 0,
         static_cast<long long>(metadata.sensor_response_offset_ns),
         static_cast<long long>(metadata.trigger_to_frame_ns),
-        metadata.utc_valid ? 1 : 0, metadata.trigger_source.c_str(),
+        metadata.utc_valid ? 1 : 0,
+        metadata.trigger_monotonic_is_uart_arrival ? 1 : 0,
+        metadata.trigger_source.c_str(),
         metadata.exposure_source.c_str());
     return text;
 }
@@ -121,7 +127,7 @@ int insert_exif(const std::vector<uint8_t> &jpeg, const Metadata &metadata,
         return EXIF_ERR_JPEG;
     }
 
-    const std::string software = std::string("camera_aiq_test stage6") + '\0';
+    const std::string software = std::string("camera_aiq_test stage7") + '\0';
     const std::string date = datetime_original(
                                  metadata.exposure_start_realtime_ns) +
                              '\0';
@@ -214,6 +220,10 @@ int self_test(std::string *report)
     metadata.trigger_id = 1007;
     metadata.trigger_monotonic_ns = 5000000000ULL;
     metadata.trigger_realtime_ns = 1710000000123456789ULL;
+    metadata.pps_id = 77;
+    metadata.trigger_timer_tick = 9123456ULL;
+    metadata.utc_valid = true;
+    metadata.trigger_monotonic_is_uart_arrival = true;
     metadata.frame_monotonic_ns = 5000012000ULL;
     metadata.frame_realtime_ns = 1710000000123468789ULL;
     metadata.exposure_start_realtime_ns = 1710000000123461789ULL;
@@ -235,6 +245,9 @@ int self_test(std::string *report)
         output[0] == 0xff && output[1] == 0xd8 && output[2] == 0xff &&
         output[3] == 0xe1 && contains_bytes(output, "Exif") &&
         contains_bytes(output, "camera_id=1;frame_id=42;trigger_id=1007") &&
+        contains_bytes(output, "pps_id=77;trigger_timer_tick=9123456") &&
+        contains_bytes(output,
+                       "utc_valid=1;trigger_monotonic_is_uart_arrival=1") &&
         contains_bytes(output, "exposure_us=5000") &&
         contains_bytes(output, "trigger_source=SIM") &&
         contains_bytes(output, "2024:03:09 16:00:00") &&
@@ -246,7 +259,7 @@ int self_test(std::string *report)
         return EXIF_ERR_VERIFY;
     }
     if (report)
-        *report = "JPEG APP1/EXIF tags and stage6 UserComment verified";
+        *report = "JPEG APP1/EXIF UTC and trigger UserComment verified";
     return EXIF_OK;
 }
 

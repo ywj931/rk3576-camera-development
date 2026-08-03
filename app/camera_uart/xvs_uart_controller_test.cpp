@@ -32,6 +32,16 @@ std::string make_frame(const std::string &payload)
     return "$" + payload + suffix;
 }
 
+std::string make_nmea(const std::string &payload)
+{
+    unsigned char checksum = 0;
+    for (unsigned char byte : payload)
+        checksum ^= byte;
+    char suffix[8];
+    std::snprintf(suffix, sizeof(suffix), "*%02X", checksum);
+    return "$" + payload + suffix;
+}
+
 bool checked_payload(const std::string &frame, std::string *payload)
 {
     if (!payload || frame.empty() || frame[0] != '$')
@@ -122,16 +132,41 @@ void mock_mcu(int master_fd, std::atomic<bool> *failed)
         const std::string &command = fields[2];
         std::string response;
         if (command == "PING" && fields.size() == 3) {
+            if (!write_all(master_fd,
+                           make_frame("EVT,PPS,10,10000000"))) {
+                *failed = true;
+                break;
+            }
             response = "ACK," + sequence + ",PONG";
         } else if (command == "IDLE" && fields.size() == 3) {
+            const std::string nmea = make_nmea(
+                "GNRMC,123519.00,A,4807.038,N,01131.000,E,0.0,0.0,"
+                "230394,,,A");
+            if (!write_all(master_fd,
+                           make_frame("EVT,NMEA,10," + nmea))) {
+                *failed = true;
+                break;
+            }
             state = "IDLE";
             response = "ACK," + sequence + ",IDLE";
         } else if (command == "START" && fields.size() == 5) {
+            if (!write_all(master_fd,
+                           make_frame("EVT,PPS,11,11000000")) ||
+                !write_all(master_fd,
+                           make_frame("EVT,XVS,101,11,11250000"))) {
+                *failed = true;
+                break;
+            }
             frequency_millihz = std::strtoul(fields[3].c_str(), nullptr, 10);
             low_pulse_us = std::strtoul(fields[4].c_str(), nullptr, 10);
             state = "RUNNING";
             response = "ACK," + sequence + ",START";
         } else if (command == "COUNT" && fields.size() == 6) {
+            if (!write_all(master_fd,
+                           make_frame("EVT,RMC,11,764426120,1"))) {
+                *failed = true;
+                break;
+            }
             frequency_millihz = std::strtoul(fields[3].c_str(), nullptr, 10);
             low_pulse_us = std::strtoul(fields[4].c_str(), nullptr, 10);
             const uint64_t requested =
@@ -169,6 +204,31 @@ bool expect_ok(const char *operation, int result)
     return false;
 }
 
+struct EventCounters {
+    std::atomic<uint32_t> pps{0};
+    std::atomic<uint32_t> rmc{0};
+    std::atomic<uint32_t> nmea{0};
+    std::atomic<uint32_t> xvs{0};
+    std::atomic<uint64_t> last_trigger_id{0};
+};
+
+void on_event(const xvs_uart_event_t *event, void *user_data)
+{
+    EventCounters *counters = static_cast<EventCounters *>(user_data);
+    if (!event || !counters)
+        return;
+    if (event->type == XVS_UART_EVENT_PPS)
+        ++counters->pps;
+    else if (event->type == XVS_UART_EVENT_RMC)
+        ++counters->rmc;
+    else if (event->type == XVS_UART_EVENT_NMEA)
+        ++counters->nmea;
+    else if (event->type == XVS_UART_EVENT_XVS) {
+        ++counters->xvs;
+        counters->last_trigger_id.store(event->trigger_id);
+    }
+}
+
 }  // namespace
 
 int main()
@@ -189,7 +249,12 @@ int main()
     std::thread mock(mock_mcu, master_fd, &mock_failed);
 
     xvs_uart_controller_t *controller = nullptr;
+    EventCounters events;
     bool success = expect_ok("create", xvs_uart_create(slave_name, &controller));
+    success = success && expect_ok(
+                             "set event callback",
+                             xvs_uart_set_event_callback(controller, on_event,
+                                                         &events));
     success = success && expect_ok("ping", xvs_uart_ping(controller));
     success = success && expect_ok("idle", xvs_uart_idle(controller));
     success = success && expect_ok("start", xvs_uart_start(controller, 4, 10));
@@ -214,6 +279,9 @@ int main()
     success = success &&
               expect_ok("idle status", xvs_uart_get_status(controller, &status));
     success = success && !std::strcmp(status.state, "IDLE");
+    success = success && events.pps.load() == 2 && events.rmc.load() == 1 &&
+              events.nmea.load() == 1 && events.xvs.load() == 1 &&
+              events.last_trigger_id.load() == 101;
 
     xvs_uart_destroy(controller);
     close(master_fd);
@@ -224,6 +292,6 @@ int main()
         std::fprintf(stderr, "XVS_UART_MOCK_TEST_FAILED\n");
         return EXIT_FAILURE;
     }
-    std::printf("XVS_UART_MOCK_TEST_OK\n");
+    std::printf("XVS_UART_MOCK_TEST_OK async_events=PPS,RMC,NMEA,XVS\n");
     return EXIT_SUCCESS;
 }

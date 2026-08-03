@@ -9,7 +9,8 @@
 - cam0/cam1 两路独立 4000x3000@10fps HTTP MJPEG 网络输出；
 - 曝光、模拟增益、帧率、开始/停止出流、开始/停止保存和状态查询命令；
 - `/dev/ttyS9` 115200、8N1 相机/输出控制入口；
-- 可选的 MCU UART XVS 控制，以及模拟 trigger 与双路 frame_id 绑定。
+- 可选的 MCU UART XVS 控制、PPS/GPRMC UTC 对时，以及 trigger 与双路
+  frame_id 绑定。
 
 UVC 将 camera0、camera1 分别输出到 `uvc.0`、`uvc.1`，依赖 USB gadget 按
 `DUAL_UVC_4000X3000_TEST_20260731.md` 配置。
@@ -26,6 +27,9 @@ IMX586 已经在同一触发沿曝光。模拟与 MCU 迁移说明见
   MPP JPEG 编码、HTTP MJPEG 多客户端输出和服务状态。
 - `trigger_frame_binder.h/.cpp`：trigger_id 与 cam0/cam1 frame_id 队列绑定。
 - `trigger_simulator.h/.cpp`：不产生物理 XVS 的 2 Hz/4 Hz 应用层模拟触发源。
+- `time_sync_service.h/.cpp`：解析 RMC，将下一 PPS 锁定到 UTC，并把 MCU
+  计数器时间换算为 UTC 纳秒。
+- `xvs_uart_controller.h/.cpp`：统一接收 XVS 命令应答和 PPS/RMC/XVS 异步事件。
 - `camera_control_uart.h/.cpp`：UART 帧解析、命令映射和 ACK/NACK 返回。
 - `camera_aiq_test.cpp`：统一的本地命令和 UART 命令入口。
 - `Makefile.camera_aiq`：板卡原生构建和 SDK 交叉构建，只输出 `camera_aiq_test`。
@@ -95,6 +99,18 @@ make -f Makefile.camera_aiq aarch64
 该模式已经写入 `camera-uvc.service`。服务启动后，一个进程同时持有两路相机、
 两路 UVC、网络和保存后端；UART 命令不会再启动第二个相机程序。
 
+连接提供 PPS、NMEA 和 XVS 事件的 MCU 时运行：
+
+```sh
+./camera_aiq_test --sync-uart /dev/ttyS9 --sync-timer-hz 1000000
+```
+
+`--sync-timer-hz` 必须等于 MCU 上报 `timer_tick` 的实际计数频率。当前
+`--control-uart` 和 `--sync-uart` 是两个独立串口角色，不能同时打开同一个设备；
+只有一条 UART 物理链路时，本版本应选择 `--sync-uart` 完成 PPS/XVS 时间链，
+普通相机控制先使用本地控制台。将两类协议复用到一条 UART 属于 MCU 接入时的
+后续接口整合项。
+
 ## 本地命令
 
 ```text
@@ -108,10 +124,13 @@ sync-bind-last
 sync-sim-start 2|4 [PULSE_COUNT]
 sync-sim-stop
 sync-sim-status
+sync-controller-status
 sync-idle
 sync-start 2|4 [LOW_PULSE_US]
 sync-count 2|4 PULSE_COUNT [LOW_PULSE_US]
 sync-stop
+time-sync-status
+time-sync-reset
 
 stream-start CAMERA_ID|all
 stream-stop CAMERA_ID|all
@@ -157,6 +176,10 @@ quit
   `test_results/20260724/network_rtsp_cam1/RK3576_IMX586_CAM1_DUAL_RTSP_TEST_REPORT.md`，
   仅作为历史测试结果，不代表当前网络协议。
 - `sync-status` 以两路当前最新帧中时间较新者为基准，在另一相机最近 32 帧中查找单调时间戳最接近的一帧并输出 `delta_ns`。只有两路都在采集且 `valid=1` 时，两路时间戳才具备同一单调时钟下的可比性。
+- `time-sync-status` 输出 PPS/RMC 接收数量、UTC 锁定状态和 holdover 状态。
+  最终照片验收必须是 `utc_valid=1`；`PPS_ONLY` 或 `UNLOCKED` 只能联调，不能
+  作为准确 UTC 时间验收结果。完整协议与测试见
+  `STAGE7_PPS_NMEA_TRIGGER_TIME_20260803.md`。
 
 ## 保存格式
 

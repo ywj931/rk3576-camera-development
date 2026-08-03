@@ -34,7 +34,7 @@ UVC_OBJECTS := rkuvc_gadget.o rkuvc_video.o rkuvc_yuv.o \
 OBJECTS := camera_aiq_test.o camera_backend.o capture_backend.o \
 	camera_uvc_backend.o camera_net_backend.o camera_photo_backend.o \
 	photo_exif.o camera_control_uart.o xvs_uart_controller.o \
-	trigger_frame_binder.o trigger_simulator.o \
+	trigger_frame_binder.o trigger_simulator.o time_sync_service.o \
 	$(UVC_OBJECTS)
 
 CROSS_CC := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc
@@ -43,6 +43,7 @@ CROSS_RKAIQ_ROOT := $(SDK_ROOT)/ubuntu/binary/usr
 CROSS_LIBC_LIB := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu/libc/lib64
 
 .PHONY: all aarch64 check check-control-uart-host check-xvs-uart \
+	check-time-sync check-stage7-host \
 	check-stage6-host clean
 
 all: $(TARGETS)
@@ -53,7 +54,7 @@ camera_aiq_test: $(OBJECTS)
 camera_aiq_test.o: camera_aiq_test.cpp camera_backend.h capture_backend.h \
 	camera_uvc_backend.h camera_net_backend.h xvs_uart_controller.h \
 	camera_photo_backend.h camera_control_uart.h photo_exif.h \
-	trigger_frame_binder.h trigger_simulator.h
+	trigger_frame_binder.h trigger_simulator.h time_sync_service.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 camera_backend.o: camera_backend.cpp camera_backend.h
@@ -84,6 +85,9 @@ trigger_frame_binder.o: trigger_frame_binder.cpp trigger_frame_binder.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 trigger_simulator.o: trigger_simulator.cpp trigger_simulator.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+time_sync_service.o: time_sync_service.cpp time_sync_service.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 rkuvc_gadget.o: $(UVC_ROOT)/uvc-gadget.c
@@ -123,6 +127,21 @@ check-xvs-uart:
 		-lutil -lpthread -o xvs_uart_controller_test
 	./xvs_uart_controller_test
 
+check-time-sync:
+	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
+		time_sync_service.cpp time_sync_service_test.cpp \
+		-lpthread -o time_sync_service_test
+	./time_sync_service_test
+
+stage7_time_pipeline_test: stage7_time_pipeline_test.cpp \
+	time_sync_service.cpp time_sync_service.h \
+	trigger_frame_binder.cpp trigger_frame_binder.h
+	$(CXX) $(CXXFLAGS) stage7_time_pipeline_test.cpp \
+		time_sync_service.cpp trigger_frame_binder.cpp -lpthread -o $@
+
+check-stage7-host: stage7_time_pipeline_test
+	./stage7_time_pipeline_test
+
 check-control-uart-host:
 	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
 		-DCAMERA_CONTROL_UART_SELF_TEST_MAIN camera_control_uart.cpp \
@@ -139,4 +158,5 @@ check-stage6-host: stage6_host_test
 
 clean:
 	$(RM) $(TARGETS) $(OBJECTS) camera_control_uart_test \
-		xvs_uart_controller_test stage6_host_test
+		xvs_uart_controller_test time_sync_service_test stage6_host_test \
+		stage7_time_pipeline_test

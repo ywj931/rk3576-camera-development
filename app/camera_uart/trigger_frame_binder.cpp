@@ -25,6 +25,10 @@ struct PendingBinding {
     uint64_t trigger_id = 0;
     uint64_t trigger_monotonic_ns = 0;
     uint64_t trigger_realtime_ns = 0;
+    uint64_t pps_id = 0;
+    uint64_t trigger_timer_tick = 0;
+    bool utc_valid = false;
+    bool monotonic_is_uart_arrival = false;
     std::string source;
     bool has_frame[2] = {false, false};
     StoredFrame frame[2];
@@ -92,6 +96,7 @@ int open_csv_locked(trigger_frame_binder_t *binder, const char *path)
         return TRIGGER_FRAME_BINDER_ERR_IO;
     const char *header =
         "trigger_id,source,trigger_monotonic_ns,trigger_realtime_ns,"
+        "pps_id,trigger_timer_tick,utc_valid,monotonic_is_uart_arrival,"
         "cam0_sequence,cam0_flags,cam0_timestamp_ns,cam0_realtime_dequeue_ns,cam0_delay_ns,"
         "cam1_sequence,cam1_flags,cam1_timestamp_ns,cam1_realtime_dequeue_ns,cam1_delay_ns,"
         "frame_delta_ns\n";
@@ -113,11 +118,14 @@ void write_binding_locked(trigger_frame_binder_t *binder,
         return;
     const int result = std::fprintf(
         binder->csv,
-        "%llu,%s,%llu,%llu,%u,0x%08x,%llu,%llu,%lld,"
+        "%llu,%s,%llu,%llu,%llu,%llu,%d,%d,%u,0x%08x,%llu,%llu,%lld,"
         "%u,0x%08x,%llu,%llu,%lld,%llu\n",
         static_cast<unsigned long long>(binding.trigger_id), binding.source,
         static_cast<unsigned long long>(binding.trigger_monotonic_ns),
         static_cast<unsigned long long>(binding.trigger_realtime_ns),
+        static_cast<unsigned long long>(binding.pps_id),
+        static_cast<unsigned long long>(binding.trigger_timer_tick),
+        binding.utc_valid, binding.monotonic_is_uart_arrival,
         binding.cam0_sequence, binding.cam0_buffer_flags,
         static_cast<unsigned long long>(binding.cam0_timestamp_ns),
         static_cast<unsigned long long>(binding.cam0_realtime_dequeue_ns),
@@ -140,6 +148,11 @@ void complete_binding_locked(trigger_frame_binder_t *binder,
     binding.trigger_id = pending.trigger_id;
     binding.trigger_monotonic_ns = pending.trigger_monotonic_ns;
     binding.trigger_realtime_ns = pending.trigger_realtime_ns;
+    binding.pps_id = pending.pps_id;
+    binding.trigger_timer_tick = pending.trigger_timer_tick;
+    binding.utc_valid = pending.utc_valid ? 1 : 0;
+    binding.monotonic_is_uart_arrival =
+        pending.monotonic_is_uart_arrival ? 1 : 0;
     std::snprintf(binding.source, sizeof(binding.source), "%s",
                   pending.source.c_str());
     binding.cam0_sequence = pending.frame[0].sequence;
@@ -246,23 +259,37 @@ extern "C" int trigger_frame_binder_on_trigger(
     trigger_frame_binder_t *binder, uint64_t trigger_id,
     uint64_t monotonic_ns, uint64_t realtime_ns, const char *source)
 {
-    if (!binder || !trigger_id || !monotonic_ns || !realtime_ns || !source ||
-        !*source || std::strlen(source) >= TRIGGER_FRAME_BINDER_SOURCE_MAX) {
+    trigger_frame_trigger_t trigger = {};
+    trigger.trigger_id = trigger_id;
+    trigger.monotonic_ns = monotonic_ns;
+    trigger.realtime_ns = realtime_ns;
+    trigger.source = source;
+    return trigger_frame_binder_on_trigger_ex(binder, &trigger);
+}
+
+extern "C" int trigger_frame_binder_on_trigger_ex(
+    trigger_frame_binder_t *binder, const trigger_frame_trigger_t *trigger)
+{
+    if (!binder || !trigger || !trigger->trigger_id ||
+        !trigger->monotonic_ns || !trigger->realtime_ns || !trigger->source ||
+        !*trigger->source ||
+        std::strlen(trigger->source) >= TRIGGER_FRAME_BINDER_SOURCE_MAX) {
         return TRIGGER_FRAME_BINDER_ERR_ARGUMENT;
     }
 
     std::lock_guard<std::mutex> lock(binder->mutex);
     ++binder->status.triggers_received;
     if (binder->have_last_trigger_id) {
-        if (trigger_id <= binder->last_trigger_id) {
+        if (trigger->trigger_id <= binder->last_trigger_id) {
             ++binder->status.duplicate_triggers;
             return TRIGGER_FRAME_BINDER_OK;
         }
-        binder->status.trigger_id_gaps += trigger_id - binder->last_trigger_id - 1;
+        binder->status.trigger_id_gaps +=
+            trigger->trigger_id - binder->last_trigger_id - 1;
     }
     binder->have_last_trigger_id = true;
-    binder->last_trigger_id = trigger_id;
-    binder->status.last_trigger_id = trigger_id;
+    binder->last_trigger_id = trigger->trigger_id;
+    binder->status.last_trigger_id = trigger->trigger_id;
 
     if (binder->triggers_to_ignore) {
         --binder->triggers_to_ignore;
@@ -274,10 +301,15 @@ extern "C" int trigger_frame_binder_on_trigger(
         ++binder->status.pending_trigger_overflows;
     }
     PendingBinding pending;
-    pending.trigger_id = trigger_id;
-    pending.trigger_monotonic_ns = monotonic_ns;
-    pending.trigger_realtime_ns = realtime_ns;
-    pending.source = source;
+    pending.trigger_id = trigger->trigger_id;
+    pending.trigger_monotonic_ns = trigger->monotonic_ns;
+    pending.trigger_realtime_ns = trigger->realtime_ns;
+    pending.pps_id = trigger->pps_id;
+    pending.trigger_timer_tick = trigger->timer_tick;
+    pending.utc_valid = trigger->utc_valid != 0;
+    pending.monotonic_is_uart_arrival =
+        trigger->monotonic_is_uart_arrival != 0;
+    pending.source = trigger->source;
     binder->pending.push_back(std::move(pending));
     binder->status.pending_triggers = binder->pending.size();
     return TRIGGER_FRAME_BINDER_OK;
@@ -368,6 +400,10 @@ extern "C" int trigger_frame_binder_find_frame(
         match->trigger_id = it->trigger_id;
         match->trigger_monotonic_ns = it->trigger_monotonic_ns;
         match->trigger_realtime_ns = it->trigger_realtime_ns;
+        match->pps_id = it->pps_id;
+        match->trigger_timer_tick = it->trigger_timer_tick;
+        match->utc_valid = it->utc_valid;
+        match->monotonic_is_uart_arrival = it->monotonic_is_uart_arrival;
         std::snprintf(match->source, sizeof(match->source), "%s", it->source);
         match->sequence = frame_sequence;
         match->buffer_flags = camera_id == 0 ? it->cam0_buffer_flags
@@ -392,6 +428,11 @@ extern "C" int trigger_frame_binder_find_frame(
         match->trigger_id = it->trigger_id;
         match->trigger_monotonic_ns = it->trigger_monotonic_ns;
         match->trigger_realtime_ns = it->trigger_realtime_ns;
+        match->pps_id = it->pps_id;
+        match->trigger_timer_tick = it->trigger_timer_tick;
+        match->utc_valid = it->utc_valid ? 1 : 0;
+        match->monotonic_is_uart_arrival =
+            it->monotonic_is_uart_arrival ? 1 : 0;
         std::snprintf(match->source, sizeof(match->source), "%s",
                       it->source.c_str());
         match->sequence = sequence;

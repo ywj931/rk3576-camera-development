@@ -238,6 +238,8 @@ camera_photo::Metadata convert_metadata(const camera_photo_metadata_t &input)
     output.trigger_id = input.trigger_id;
     output.trigger_monotonic_ns = input.trigger_monotonic_ns;
     output.trigger_realtime_ns = input.trigger_realtime_ns;
+    output.pps_id = input.pps_id;
+    output.trigger_timer_tick = input.trigger_timer_tick;
     output.frame_monotonic_ns = input.frame_monotonic_ns;
     output.frame_realtime_ns = input.frame_realtime_ns;
     output.exposure_start_realtime_ns = input.exposure_start_realtime_ns;
@@ -248,6 +250,8 @@ camera_photo::Metadata convert_metadata(const camera_photo_metadata_t &input)
     output.gain_x1000 = input.gain_x1000;
     output.iso = input.iso;
     output.utc_valid = input.utc_valid != 0;
+    output.trigger_monotonic_is_uart_arrival =
+        input.trigger_monotonic_is_uart_arrival != 0;
     output.iso_estimated = input.iso_estimated != 0;
     output.trigger_source = input.trigger_source;
     output.exposure_source = input.exposure_source;
@@ -302,10 +306,11 @@ void write_csv_header(FILE *file)
 {
     std::fputs(
         "camera_id,frame_id,trigger_id,trigger_source,trigger_monotonic_ns,"
-        "trigger_realtime_ns,frame_monotonic_ns,frame_realtime_ns,"
+        "trigger_realtime_ns,pps_id,trigger_timer_tick,utc_valid,"
+        "trigger_monotonic_is_uart_arrival,frame_monotonic_ns,frame_realtime_ns,"
         "exposure_start_realtime_ns,exposure_center_realtime_ns,"
         "exposure_us,gain_x1000,iso,iso_estimated,response_offset_ns,"
-        "trigger_to_frame_ns,utc_valid,exposure_source,jpeg_path\n",
+        "trigger_to_frame_ns,exposure_source,jpeg_path\n",
         file);
     std::fflush(file);
 }
@@ -317,20 +322,23 @@ void write_csv_record(FILE *file, const camera_photo_metadata_t &m,
         return;
     std::fprintf(
         file,
-        "%d,%u,%llu,%s,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%d,"
-        "%lld,%lld,%d,%s,%s\n",
+        "%d,%u,%llu,%s,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,"
+        "%u,%u,%u,%d,%lld,%lld,%s,%s\n",
         m.camera_id, m.frame_id,
         static_cast<unsigned long long>(m.trigger_id), m.trigger_source,
         static_cast<unsigned long long>(m.trigger_monotonic_ns),
         static_cast<unsigned long long>(m.trigger_realtime_ns),
+        static_cast<unsigned long long>(m.pps_id),
+        static_cast<unsigned long long>(m.trigger_timer_tick), m.utc_valid,
+        m.trigger_monotonic_is_uart_arrival,
         static_cast<unsigned long long>(m.frame_monotonic_ns),
         static_cast<unsigned long long>(m.frame_realtime_ns),
         static_cast<unsigned long long>(m.exposure_start_realtime_ns),
         static_cast<unsigned long long>(m.exposure_center_realtime_ns),
         m.exposure_us, m.gain_x1000, m.iso, m.iso_estimated,
         static_cast<long long>(m.sensor_response_offset_ns),
-        static_cast<long long>(m.trigger_to_frame_ns), m.utc_valid,
-        m.exposure_source, path.c_str());
+        static_cast<long long>(m.trigger_to_frame_ns), m.exposure_source,
+        path.c_str());
     std::fflush(file);
 }
 

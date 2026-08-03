@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 #define XVS_UART_PATH_MAX 256
+#define XVS_UART_NMEA_MAX 192
 
 typedef struct xvs_uart_controller xvs_uart_controller_t;
 
@@ -33,6 +34,28 @@ typedef struct xvs_uart_status {
     char device[XVS_UART_PATH_MAX];
 } xvs_uart_status_t;
 
+enum xvs_uart_event_type {
+    XVS_UART_EVENT_PPS = 1,
+    XVS_UART_EVENT_RMC = 2,
+    XVS_UART_EVENT_NMEA = 3,
+    XVS_UART_EVENT_XVS = 4,
+};
+
+typedef struct xvs_uart_event {
+    enum xvs_uart_event_type type;
+    uint64_t pps_id;
+    uint64_t trigger_id;
+    uint64_t timer_tick;
+    int64_t utc_sec;
+    int valid;
+    uint64_t uart_receive_monotonic_ns;
+    uint64_t uart_receive_realtime_ns;
+    char nmea[XVS_UART_NMEA_MAX];
+} xvs_uart_event_t;
+
+typedef void (*xvs_uart_event_callback_t)(const xvs_uart_event_t *event,
+                                          void *user_data);
+
 int xvs_uart_create(const char *device, xvs_uart_controller_t **controller_out);
 void xvs_uart_destroy(xvs_uart_controller_t *controller);
 
@@ -46,6 +69,9 @@ int xvs_uart_count(xvs_uart_controller_t *controller,
 int xvs_uart_stop(xvs_uart_controller_t *controller);
 int xvs_uart_get_status(xvs_uart_controller_t *controller,
                         xvs_uart_status_t *status);
+int xvs_uart_set_event_callback(xvs_uart_controller_t *controller,
+                                xvs_uart_event_callback_t callback,
+                                void *user_data);
 
 int xvs_uart_protocol_self_test(void);
 const char *xvs_uart_strerror(int result);

@@ -5,6 +5,7 @@
 #include "camera_uvc_backend.h"
 #include "capture_backend.h"
 #include "photo_exif.h"
+#include "time_sync_service.h"
 #include "trigger_frame_binder.h"
 #include "trigger_simulator.h"
 #include "xvs_uart_controller.h"
@@ -61,6 +62,19 @@ bool parse_i64(const std::string &text, int64_t *value)
     return true;
 }
 
+bool parse_u64(const std::string &text, uint64_t *value)
+{
+    if (!value || text.empty() || text[0] == '-')
+        return false;
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+    if (errno || end == text.c_str() || *end != '\0')
+        return false;
+    *value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
 uint64_t add_signed_ns(uint64_t base, int64_t offset)
 {
     if (offset >= 0)
@@ -100,6 +114,7 @@ void print_usage(const char *program)
         << "  --control-uart DEVICE  receive camera/output commands (115200 8N1)\n"
         << "  --control-uart-protocol-self-test  test control protocol without hardware\n"
         << "  --sync-uart DEVICE  MCU XVS control UART (115200 8N1)\n"
+        << "  --sync-timer-hz HZ  MCU high-resolution timer frequency (default: 1000000)\n"
         << "  --sync-protocol-self-test  test XVS protocol without camera hardware\n"
         << "  --sync-bind-self-test  test simulated trigger/frame binding without camera hardware\n"
         << "  --photo-exif-self-test  test JPEG EXIF generation without camera hardware\n"
@@ -137,6 +152,8 @@ void print_commands()
         << "  sync-count 2|4 PULSE_COUNT [LOW_PULSE_US]\n"
         << "  sync-stop\n"
         << "  sync-controller-status\n"
+        << "  time-sync-status\n"
+        << "  time-sync-reset\n"
         << "  sync-bind-reset [PRE_SHUTTER_TRIGGERS]\n"
         << "  sync-bind-log CSV_PATH|off\n"
         << "  sync-bind-status\n"
@@ -261,6 +278,33 @@ void print_xvs_controller_status(xvs_uart_controller_t *controller)
               << " device=\"" << status.device << "\"\n";
 }
 
+void print_time_sync_status(time_sync_service_t *time_sync)
+{
+    time_sync_status_t status = {};
+    const int result = time_sync_get_status(time_sync, &status);
+    if (result != TIME_SYNC_OK) {
+        std::cout << "ERROR command=time-sync-status code=" << result
+                  << " reason=\"" << time_sync_strerror(result) << "\"\n";
+        return;
+    }
+    std::cout << "TIME_SYNC_STATUS state="
+              << time_sync_state_name(status.state)
+              << " utc_valid=" << status.utc_valid
+              << " timer_frequency_hz=" << status.timer_frequency_hz
+              << " holdover_age_pps=" << status.holdover_age_pps
+              << " max_holdover_pps=" << status.max_holdover_pps
+              << " pps_events=" << status.pps_events
+              << " rmc_events=" << status.rmc_events
+              << " invalid_rmc_events=" << status.invalid_rmc_events
+              << " resolved_events=" << status.resolved_events
+              << " unresolved_events=" << status.unresolved_events
+              << " last_pps_id=" << status.last_pps_id
+              << " last_pps_tick=" << status.last_pps_tick
+              << " last_rmc_pps_id=" << status.last_rmc_pps_id
+              << " last_rmc_utc_sec=" << status.last_rmc_utc_sec
+              << " reference_utc_ns=" << status.reference_utc_ns << '\n';
+}
+
 void print_trigger_binding_status(trigger_frame_binder_t *binder)
 {
     trigger_frame_binder_status_t status = {};
@@ -312,6 +356,11 @@ void print_trigger_binding_last(trigger_frame_binder_t *binder)
               << binding.trigger_id << " source=" << binding.source
               << " trigger_monotonic_ns=" << binding.trigger_monotonic_ns
               << " trigger_realtime_ns=" << binding.trigger_realtime_ns
+              << " pps_id=" << binding.pps_id
+              << " trigger_timer_tick=" << binding.trigger_timer_tick
+              << " utc_valid=" << binding.utc_valid
+              << " monotonic_is_uart_arrival="
+              << binding.monotonic_is_uart_arrival
               << " cam0_sequence=" << binding.cam0_sequence
               << " cam0_timestamp_ns=" << binding.cam0_timestamp_ns
               << " cam0_delay_ns=" << binding.cam0_delay_ns
@@ -367,6 +416,63 @@ void simulator_to_trigger_binder(uint64_t trigger_id, uint64_t monotonic_ns,
         std::cerr << "TRIGGER_BIND_SIM_ERROR trigger_id=" << trigger_id
                   << " code=" << result << " reason=\""
                   << trigger_frame_binder_strerror(result) << "\"\n";
+    }
+}
+
+struct xvs_event_context {
+    time_sync_service_t *time_sync = nullptr;
+    trigger_frame_binder_t *binder = nullptr;
+    std::atomic<uint64_t> event_errors{0};
+};
+
+void xvs_event_to_time_and_frame(const xvs_uart_event_t *event,
+                                 void *user_data)
+{
+    auto *context = static_cast<xvs_event_context *>(user_data);
+    if (!event || !context || !context->time_sync || !context->binder)
+        return;
+
+    int result = TIME_SYNC_OK;
+    if (event->type == XVS_UART_EVENT_PPS) {
+        result = time_sync_on_pps(context->time_sync, event->pps_id,
+                                  event->timer_tick);
+    } else if (event->type == XVS_UART_EVENT_RMC) {
+        result = time_sync_on_rmc_utc(context->time_sync, event->pps_id,
+                                      event->utc_sec, event->valid);
+    } else if (event->type == XVS_UART_EVENT_NMEA) {
+        result = time_sync_on_nmea_rmc(context->time_sync, event->pps_id,
+                                       event->nmea);
+    } else if (event->type == XVS_UART_EVENT_XVS) {
+        time_sync_resolution_t resolution = {};
+        const int resolve_result = time_sync_resolve_tick(
+            context->time_sync, event->pps_id, event->timer_tick,
+            &resolution);
+        trigger_frame_trigger_t trigger = {};
+        trigger.trigger_id = event->trigger_id;
+        trigger.monotonic_ns = event->uart_receive_monotonic_ns;
+        trigger.realtime_ns =
+            resolve_result == TIME_SYNC_OK && resolution.valid
+                ? resolution.utc_ns
+                : event->uart_receive_realtime_ns;
+        trigger.pps_id = event->pps_id;
+        trigger.timer_tick = event->timer_tick;
+        trigger.utc_valid =
+            resolve_result == TIME_SYNC_OK && resolution.valid ? 1 : 0;
+        trigger.monotonic_is_uart_arrival = 1;
+        trigger.source = trigger.utc_valid
+                             ? (resolution.state == TIME_SYNC_STATE_HOLDOVER
+                                    ? "MCU_PPS_HOLDOVER"
+                                    : "MCU_PPS_LOCKED")
+                             : "MCU_PPS_UNLOCKED";
+        result = trigger_frame_binder_on_trigger_ex(context->binder,
+                                                     &trigger);
+    }
+    if (result != 0) {
+        ++context->event_errors;
+        std::cerr << "XVS_EVENT_ERROR type=" << event->type
+                  << " pps_id=" << event->pps_id
+                  << " trigger_id=" << event->trigger_id
+                  << " code=" << result << '\n';
     }
 }
 
@@ -653,6 +759,8 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
     metadata.trigger_id = match.trigger_id;
     metadata.trigger_monotonic_ns = match.trigger_monotonic_ns;
     metadata.trigger_realtime_ns = match.trigger_realtime_ns;
+    metadata.pps_id = match.pps_id;
+    metadata.trigger_timer_tick = match.trigger_timer_tick;
     metadata.frame_monotonic_ns = match.v4l2_timestamp_ns;
     metadata.frame_realtime_ns = match.realtime_dequeue_ns;
     metadata.trigger_to_frame_ns = match.trigger_to_frame_ns;
@@ -674,8 +782,9 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
     metadata.exposure_center_realtime_ns =
         metadata.exposure_start_realtime_ns +
         static_cast<uint64_t>(metadata.exposure_us) * 500ULL;
-    metadata.utc_valid =
-        std::strcmp(match.source, "MCU_PPS") == 0 ? 1 : 0;
+    metadata.utc_valid = match.utc_valid;
+    metadata.trigger_monotonic_is_uart_arrival =
+        match.monotonic_is_uart_arrival;
     std::snprintf(metadata.trigger_source,
                   sizeof(metadata.trigger_source), "%s", match.source);
     std::snprintf(metadata.exposure_source,
@@ -722,6 +831,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
                      camera_uvc_backend_t *uvc, camera_net_backend_t *net,
                      camera_photo_backend_t *photo,
                      xvs_uart_controller_t *xvs,
+                     time_sync_service_t *time_sync,
                      trigger_frame_binder_t *binder,
                      trigger_simulator_t *simulator,
                      const std::string &line)
@@ -1191,6 +1301,32 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
         return true;
     }
 
+    if (command == "time-sync-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "time-sync-status");
+            return true;
+        }
+        print_time_sync_status(time_sync);
+        return true;
+    }
+
+    if (command == "time-sync-reset") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "time-sync-reset");
+            return true;
+        }
+        const int result = time_sync_reset(time_sync);
+        if (result == TIME_SYNC_OK)
+            std::cout << "OK command=time-sync-reset\n";
+        else
+            std::cout << "ERROR command=time-sync-reset code=" << result
+                      << " reason=\"" << time_sync_strerror(result)
+                      << "\"\n";
+        return true;
+    }
+
     if (command == "sync-bind-reset") {
         std::string ignored_text;
         std::string extra;
@@ -1323,6 +1459,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             return true;
         }
         print_xvs_controller_status(xvs);
+        print_time_sync_status(time_sync);
         print_sync_status(capture);
         print_trigger_binding_status(binder);
         print_trigger_simulator_status(simulator);
@@ -1586,6 +1723,8 @@ int main(int argc, char **argv)
     camera_backend_default_config(&config);
     capture_backend_config_t capture_config = {};
     capture_backend_default_config(&capture_config);
+    time_sync_config_t time_sync_config = {};
+    time_sync_default_config(&time_sync_config);
     std::string iq_dirs[CAMERA_BACKEND_CAMERA_COUNT];
     std::string expected_sensors[CAMERA_BACKEND_CAMERA_COUNT];
     std::string params_devices[CAMERA_BACKEND_CAMERA_COUNT];
@@ -1674,6 +1813,14 @@ int main(int argc, char **argv)
                 expected_sensors[camera_id].c_str();
         } else if (option == "--sync-uart") {
             sync_uart_device = value;
+        } else if (option == "--sync-timer-hz") {
+            if (!parse_u64(value, &time_sync_config.timer_frequency_hz) ||
+                !time_sync_config.timer_frequency_hz ||
+                time_sync_config.timer_frequency_hz > 1000000000ULL) {
+                std::cerr << "Invalid MCU timer frequency: " << value
+                          << '\n';
+                return EXIT_FAILURE;
+            }
         } else if (option == "--control-uart") {
             control_uart_device = value;
         } else {
@@ -1836,6 +1983,20 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    time_sync_service_t *time_sync = nullptr;
+    result = time_sync_create(&time_sync_config, &time_sync);
+    if (result != TIME_SYNC_OK) {
+        std::cerr << "TIME_SYNC_START_FAILED code=" << result
+                  << " reason=\"" << time_sync_strerror(result) << "\"\n";
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
     trigger_simulator_t *simulator = nullptr;
     result = trigger_simulator_create(simulator_to_trigger_binder, binder,
                                       &simulator);
@@ -1843,6 +2004,7 @@ int main(int argc, char **argv)
         std::cerr << "TRIGGER_SIMULATOR_START_FAILED code=" << result
                   << " reason=\"" << trigger_simulator_strerror(result)
                   << "\"\n";
+        time_sync_destroy(time_sync);
         trigger_frame_binder_destroy(binder);
         camera_photo_destroy(photo);
         camera_net_destroy(net);
@@ -1868,6 +2030,7 @@ int main(int argc, char **argv)
                   << " reason=\"" << capture_backend_strerror(result)
                   << "\"\n";
         trigger_simulator_destroy(simulator);
+        time_sync_destroy(time_sync);
         trigger_frame_binder_destroy(binder);
         camera_photo_destroy(photo);
         camera_net_destroy(net);
@@ -1877,9 +2040,15 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    xvs_event_context xvs_events;
+    xvs_events.time_sync = time_sync;
+    xvs_events.binder = binder;
     xvs_uart_controller_t *xvs = nullptr;
     if (!sync_uart_device.empty()) {
         result = xvs_uart_create(sync_uart_device.c_str(), &xvs);
+        if (result == XVS_UART_OK)
+            result = xvs_uart_set_event_callback(
+                xvs, xvs_event_to_time_and_frame, &xvs_events);
         if (result == XVS_UART_OK)
             result = xvs_uart_ping(xvs);
         if (result == XVS_UART_OK)
@@ -1891,6 +2060,7 @@ int main(int argc, char **argv)
                       << "\"\n";
             xvs_uart_destroy(xvs);
             trigger_simulator_destroy(simulator);
+            time_sync_destroy(time_sync);
             trigger_frame_binder_destroy(binder);
             camera_photo_destroy(photo);
             camera_net_destroy(net);
@@ -1900,7 +2070,9 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         std::cout << "XVS_UART_READY device=\"" << sync_uart_device
-                  << "\" baud=115200 format=8N1 output_state=IDLE_HIGH\n";
+                  << "\" baud=115200 format=8N1 output_state=IDLE_HIGH"
+                  << " timer_frequency_hz="
+                  << time_sync_config.timer_frequency_hz << '\n';
     }
 
     std::cout << "CAMERA_BACKEND_READY cameras=" << CAMERA_BACKEND_CAMERA_COUNT
@@ -1913,6 +2085,7 @@ int main(int argc, char **argv)
     if (autostart && !autostart_http_outputs(capture, net)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
+        time_sync_destroy(time_sync);
         capture_backend_destroy(capture);
         trigger_frame_binder_destroy(binder);
         camera_photo_destroy(photo);
@@ -1925,6 +2098,7 @@ int main(int argc, char **argv)
     if (uvc_autostart && !autostart_uvc_output(capture, uvc)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
+        time_sync_destroy(time_sync);
         capture_backend_destroy(capture);
         trigger_frame_binder_destroy(binder);
         camera_photo_destroy(photo);
@@ -1942,8 +2116,8 @@ int main(int argc, char **argv)
                                  std::string *output) {
             std::ostringstream capture_output;
             std::streambuf *saved = std::cout.rdbuf(capture_output.rdbuf());
-            execute_command(backend, capture, uvc, net, photo, xvs, binder,
-                            simulator, command);
+            execute_command(backend, capture, uvc, net, photo, xvs,
+                            time_sync, binder, simulator, command);
             std::cout.flush();
             std::cout.rdbuf(saved);
             *output = capture_output.str();
@@ -1969,8 +2143,8 @@ int main(int argc, char **argv)
                 std::cout << "camera-aiq> " << std::flush;
             if (!std::getline(std::cin, line))
                 break;
-            if (!execute_command(backend, capture, uvc, net, photo, xvs, binder,
-                                 simulator, line))
+            if (!execute_command(backend, capture, uvc, net, photo, xvs,
+                                 time_sync, binder, simulator, line))
                 break;
         }
     }
@@ -1987,6 +2161,7 @@ int main(int argc, char **argv)
     }
     capture_backend_destroy(capture);
     trigger_frame_binder_destroy(binder);
+    time_sync_destroy(time_sync);
     camera_photo_destroy(photo);
     camera_net_destroy(net);
     camera_uvc_destroy(uvc);

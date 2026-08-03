@@ -31,11 +31,26 @@ typedef struct trigger_frame_event {
     uint64_t realtime_dequeue_ns;
 } trigger_frame_event_t;
 
+typedef struct trigger_frame_trigger {
+    uint64_t trigger_id;
+    uint64_t monotonic_ns;
+    uint64_t realtime_ns;
+    uint64_t pps_id;
+    uint64_t timer_tick;
+    int utc_valid;
+    int monotonic_is_uart_arrival;
+    const char *source;
+} trigger_frame_trigger_t;
+
 typedef struct trigger_frame_binding {
     int valid;
     uint64_t trigger_id;
     uint64_t trigger_monotonic_ns;
     uint64_t trigger_realtime_ns;
+    uint64_t pps_id;
+    uint64_t trigger_timer_tick;
+    int utc_valid;
+    int monotonic_is_uart_arrival;
     char source[TRIGGER_FRAME_BINDER_SOURCE_MAX];
     uint32_t cam0_sequence;
     uint32_t cam0_buffer_flags;
@@ -64,6 +79,10 @@ typedef struct trigger_frame_match {
     uint64_t trigger_id;
     uint64_t trigger_monotonic_ns;
     uint64_t trigger_realtime_ns;
+    uint64_t pps_id;
+    uint64_t trigger_timer_tick;
+    int utc_valid;
+    int monotonic_is_uart_arrival;
     char source[TRIGGER_FRAME_BINDER_SOURCE_MAX];
     uint32_t sequence;
     uint32_t buffer_flags;
@@ -106,6 +125,8 @@ int trigger_frame_binder_on_trigger(trigger_frame_binder_t *binder,
                                     uint64_t monotonic_ns,
                                     uint64_t realtime_ns,
                                     const char *source);
+int trigger_frame_binder_on_trigger_ex(trigger_frame_binder_t *binder,
+                                       const trigger_frame_trigger_t *trigger);
 int trigger_frame_binder_on_frame(trigger_frame_binder_t *binder,
                                   const trigger_frame_event_t *frame);
 int trigger_frame_binder_get_status(trigger_frame_binder_t *binder,

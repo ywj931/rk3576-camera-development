@@ -38,6 +38,8 @@ typedef struct camera_photo_metadata {
     uint64_t trigger_id;
     uint64_t trigger_monotonic_ns;
     uint64_t trigger_realtime_ns;
+    uint64_t pps_id;
+    uint64_t trigger_timer_tick;
     uint64_t frame_monotonic_ns;
     uint64_t frame_realtime_ns;
     uint64_t exposure_start_realtime_ns;
@@ -48,6 +50,7 @@ typedef struct camera_photo_metadata {
     uint32_t gain_x1000;
     uint32_t iso;
     int utc_valid;
+    int trigger_monotonic_is_uart_arrival;
     int iso_estimated;
     char trigger_source[CAMERA_PHOTO_SOURCE_MAX];
     char exposure_source[CAMERA_PHOTO_SOURCE_MAX];

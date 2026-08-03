@@ -13,6 +13,8 @@ struct Metadata {
     uint64_t trigger_id = 0;
     uint64_t trigger_monotonic_ns = 0;
     uint64_t trigger_realtime_ns = 0;
+    uint64_t pps_id = 0;
+    uint64_t trigger_timer_tick = 0;
     uint64_t frame_monotonic_ns = 0;
     uint64_t frame_realtime_ns = 0;
     uint64_t exposure_start_realtime_ns = 0;
@@ -23,6 +25,7 @@ struct Metadata {
     uint32_t gain_x1000 = 0;
     uint32_t iso = 0;
     bool utc_valid = false;
+    bool trigger_monotonic_is_uart_arrival = false;
     bool iso_estimated = false;
     std::string trigger_source;
     std::string exposure_source;
