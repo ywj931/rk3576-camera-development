@@ -64,6 +64,7 @@ void camera_uvc_destroy(camera_uvc_backend_t *backend);
 
 int camera_uvc_start(camera_uvc_backend_t *backend, int camera_id);
 int camera_uvc_start_all(camera_uvc_backend_t *backend);
+int camera_uvc_stop_camera(camera_uvc_backend_t *backend, int camera_id);
 int camera_uvc_stop(camera_uvc_backend_t *backend);
 int camera_uvc_submit_nv12(camera_uvc_backend_t *backend, int camera_id,
                            const void *plane0, size_t plane0_size,

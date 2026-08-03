@@ -33,7 +33,7 @@ UVC_OBJECTS := rkuvc_gadget.o rkuvc_video.o rkuvc_yuv.o \
 	rkuvc_control.o rkuvc_encode.o rkuvc_uevent.o
 OBJECTS := camera_aiq_test.o camera_backend.o capture_backend.o \
 	camera_uvc_backend.o camera_net_backend.o camera_photo_backend.o \
-	photo_exif.o xvs_uart_controller.o \
+	photo_exif.o camera_control_uart.o xvs_uart_controller.o \
 	trigger_frame_binder.o trigger_simulator.o \
 	$(UVC_OBJECTS)
 
@@ -42,7 +42,8 @@ CROSS_CXX := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x8
 CROSS_RKAIQ_ROOT := $(SDK_ROOT)/ubuntu/binary/usr
 CROSS_LIBC_LIB := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu/libc/lib64
 
-.PHONY: all aarch64 check check-xvs-uart check-stage6-host clean
+.PHONY: all aarch64 check check-control-uart-host check-xvs-uart \
+	check-stage6-host clean
 
 all: $(TARGETS)
 
@@ -51,7 +52,8 @@ camera_aiq_test: $(OBJECTS)
 
 camera_aiq_test.o: camera_aiq_test.cpp camera_backend.h capture_backend.h \
 	camera_uvc_backend.h camera_net_backend.h xvs_uart_controller.h \
-	camera_photo_backend.h photo_exif.h trigger_frame_binder.h trigger_simulator.h
+	camera_photo_backend.h camera_control_uart.h photo_exif.h \
+	trigger_frame_binder.h trigger_simulator.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 camera_backend.o: camera_backend.cpp camera_backend.h
@@ -70,6 +72,9 @@ camera_photo_backend.o: camera_photo_backend.cpp camera_photo_backend.h photo_ex
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 photo_exif.o: photo_exif.cpp photo_exif.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+camera_control_uart.o: camera_control_uart.cpp camera_control_uart.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 xvs_uart_controller.o: xvs_uart_controller.cpp xvs_uart_controller.h
@@ -110,12 +115,19 @@ check: camera_aiq_test
 	./camera_aiq_test --help
 	./camera_aiq_test --sync-bind-self-test
 	./camera_aiq_test --photo-exif-self-test
+	./camera_aiq_test --control-uart-protocol-self-test
 
 check-xvs-uart:
 	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
 		xvs_uart_controller.cpp xvs_uart_controller_test.cpp \
 		-lutil -lpthread -o xvs_uart_controller_test
 	./xvs_uart_controller_test
+
+check-control-uart-host:
+	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
+		-DCAMERA_CONTROL_UART_SELF_TEST_MAIN camera_control_uart.cpp \
+		-lutil -lpthread -o camera_control_uart_test
+	./camera_control_uart_test
 
 stage6_host_test: stage6_host_test.cpp photo_exif.cpp photo_exif.h \
 	trigger_frame_binder.cpp trigger_frame_binder.h
@@ -126,4 +138,5 @@ check-stage6-host: stage6_host_test
 	./stage6_host_test
 
 clean:
-	$(RM) $(TARGETS) $(OBJECTS) xvs_uart_controller_test stage6_host_test
+	$(RM) $(TARGETS) $(OBJECTS) camera_control_uart_test \
+		xvs_uart_controller_test stage6_host_test

@@ -5,12 +5,14 @@
 - cam0/cam1 两路独立 RKAIQ context；
 - cam0/cam1 两路 V4L2 NV12M 采集线程；
 - 两路独立的异步保存线程和状态；
-- camera0 单路 4000x3000 MJPEG UVC 输出；
+- cam0/cam1 两路独立 4000x3000@10fps MJPEG UVC 输出；
 - cam0/cam1 两路独立 4000x3000@10fps HTTP MJPEG 网络输出；
 - 曝光、模拟增益、帧率、开始/停止出流、开始/停止保存和状态查询命令；
+- `/dev/ttyS9` 115200、8N1 相机/输出控制入口；
 - 可选的 MCU UART XVS 控制，以及模拟 trigger 与双路 frame_id 绑定。
 
-UVC 仅输出 camera0，依赖 USB gadget 已按 `UVC_4000X3000_TEST.md` 配置。
+UVC 将 camera0、camera1 分别输出到 `uvc.0`、`uvc.1`，依赖 USB gadget 按
+`DUAL_UVC_4000X3000_TEST_20260731.md` 配置。
 `sync-status` 的 V4L2 时间戳比较和软件模拟触发都属于诊断工具，不代表两颗
 IMX586 已经在同一触发沿曝光。模拟与 MCU 迁移说明见
 `TRIGGER_FRAME_BINDING_SIM_TEST.md`。
@@ -19,14 +21,16 @@ IMX586 已经在同一触发沿曝光。模拟与 MCU 迁移说明见
 
 - `camera_backend.h/.cpp`：双路 RKAIQ 初始化、独立曝光、独立模拟增益、帧率和 AIQ 状态。
 - `capture_backend.h/.cpp`：双路 V4L2 出流、帧统计、异步 NV12 保存和保存状态。
-- `camera_uvc_backend.h/.cpp`：camera0 帧队列、MPP MJPEG 编码和 UVC 状态。
+- `camera_uvc_backend.h/.cpp`：cam0/cam1 独立帧队列、MPP MJPEG 编码和 UVC 状态。
 - `camera_net_backend.h/.cpp`：cam0/cam1 独立最新帧队列、10 fps 主动节流、
   MPP JPEG 编码、HTTP MJPEG 多客户端输出和服务状态。
 - `trigger_frame_binder.h/.cpp`：trigger_id 与 cam0/cam1 frame_id 队列绑定。
 - `trigger_simulator.h/.cpp`：不产生物理 XVS 的 2 Hz/4 Hz 应用层模拟触发源。
-- `camera_aiq_test.cpp`：统一的本地命令入口。
+- `camera_control_uart.h/.cpp`：UART 帧解析、命令映射和 ACK/NACK 返回。
+- `camera_aiq_test.cpp`：统一的本地命令和 UART 命令入口。
 - `Makefile.camera_aiq`：板卡原生构建和 SDK 交叉构建，只输出 `camera_aiq_test`。
 - `camera-http.service`：双摄采集和 HTTP 输出的 systemd 常驻服务。
+- `camera-uvc.service`：双摄采集、双 UVC 输出和 UART 控制的常驻服务。
 
 新程序默认打开 `/dev/video22` 和 `/dev/video31`。执行 `stream-start` 后，不要再运行旧的 `v4l2-ctl` 或 `v4l2_frame_tap` 占用同一节点。
 
@@ -82,6 +86,15 @@ make -f Makefile.camera_aiq aarch64
 `http://<board-ip>:8080/cam1`，或用 `http://<board-ip>:8080/` 同时查看两路。
 开机常驻配置和协议说明见 `NETWORK_HTTP_MJPEG.md`。
 
+双路 UVC 并从 UART 接收控制命令时运行：
+
+```sh
+./camera_aiq_test --uvc-daemon --control-uart /dev/ttyS9
+```
+
+该模式已经写入 `camera-uvc.service`。服务启动后，一个进程同时持有两路相机、
+两路 UVC、网络和保存后端；UART 命令不会再启动第二个相机程序。
+
 ## 本地命令
 
 ```text
@@ -105,9 +118,9 @@ stream-stop CAMERA_ID|all
 save-start CAMERA_ID OUTPUT_DIR
 save-stop CAMERA_ID
 
-uvc-start 0
-uvc-stop
-uvc-status
+uvc-start CAMERA_ID|all
+uvc-stop [CAMERA_ID|all]
+uvc-status [CAMERA_ID|all]
 
 net-start CAMERA_ID
 net-stop [CAMERA_ID|all]
@@ -132,9 +145,10 @@ quit
 - `OUTPUT_DIR` 必须是没有空格的绝对路径。程序会创建不存在的目录。
 - `save-start` 只在该路已经 `stream-start` 后成功。
 - `save-stop` 停止接收新保存帧，并等待已经进入写盘队列的帧处理完成后返回。
-- `uvc-start 0` 只能在 camera0 已经 `stream-start 0` 后执行。主机未打开视频流
-  时，`skipped_no_host` 增长是正常状态；完整 UVC 抓图流程见
-  `UVC_4000X3000_TEST.md`。
+- `uvc-start CAMERA_ID|all` 只能在对应相机已经出流后执行。`uvc-stop 0` 只停止
+  camera0 的送帧与编码，camera1 和两个 USB 接口保持不变；主机未打开视频流时，
+  `skipped_no_host` 增长是正常状态。完整抓图流程见
+  `DUAL_UVC_4000X3000_TEST_20260731.md`。
 - `net-start CAMERA_ID` 要求对应相机已经出流，camera0/camera1 分别固定发布
   `http://<board-ip>:8080/cam0` 和 `http://<board-ip>:8080/cam1`。采集通常约
   30 fps，各路网络后端主动只编码每 100 ms 的最新一帧；因此 `queue_drops`

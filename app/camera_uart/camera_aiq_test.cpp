@@ -1,4 +1,5 @@
 #include "camera_backend.h"
+#include "camera_control_uart.h"
 #include "camera_net_backend.h"
 #include "camera_photo_backend.h"
 #include "camera_uvc_backend.h"
@@ -96,6 +97,8 @@ void print_usage(const char *program)
         << "  --autostart         start capture and HTTP output for both cameras\n"
         << "  --daemon            autostart both cameras and run without console input\n"
         << "  --uvc-daemon        start both cameras and two UVC outputs without console input\n"
+        << "  --control-uart DEVICE  receive camera/output commands (115200 8N1)\n"
+        << "  --control-uart-protocol-self-test  test control protocol without hardware\n"
         << "  --sync-uart DEVICE  MCU XVS control UART (115200 8N1)\n"
         << "  --sync-protocol-self-test  test XVS protocol without camera hardware\n"
         << "  --sync-bind-self-test  test simulated trigger/frame binding without camera hardware\n"
@@ -124,7 +127,7 @@ void print_commands()
         << "  photo-offset CAMERA_ID SENSOR_RESPONSE_OFFSET_NS\n"
         << "  capture-status [all|0|1]\n"
         << "  uvc-start CAMERA_ID|all\n"
-        << "  uvc-stop\n"
+        << "  uvc-stop [CAMERA_ID|all]\n"
         << "  uvc-status [CAMERA_ID|all]\n"
         << "  net-start CAMERA_ID\n"
         << "  net-stop [CAMERA_ID|all]\n"
@@ -976,16 +979,26 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
     }
 
     if (command == "uvc-stop") {
+        std::string target = "all";
         std::string extra;
+        stream >> target;
         if (stream >> extra) {
-            invalid_command(command, "uvc-stop");
+            invalid_command(command, "uvc-stop [CAMERA_ID|all]");
             return true;
         }
-        const int result = camera_uvc_stop(uvc);
+        int camera_id = -1;
+        if (target != "all" && !parse_camera_id(target, &camera_id)) {
+            invalid_command(command, "uvc-stop [CAMERA_ID|all]");
+            return true;
+        }
+        const int result = target == "all"
+                               ? camera_uvc_stop(uvc)
+                               : camera_uvc_stop_camera(uvc, camera_id);
         if (result == CAMERA_UVC_OK) {
-            std::cout << "OK command=uvc-stop\n";
+            std::cout << "OK command=uvc-stop target=" << target << '\n';
         } else {
-            std::cout << "ERROR command=uvc-stop code=" << result
+            std::cout << "ERROR command=uvc-stop target=" << target
+                      << " code=" << result
                       << " reason=\"" << camera_uvc_strerror(result)
                       << "\"\n";
         }
@@ -1583,7 +1596,9 @@ int main(int argc, char **argv)
     bool sync_protocol_self_test = false;
     bool sync_bind_self_test = false;
     bool photo_exif_self_test = false;
+    bool control_uart_protocol_self_test = false;
     std::string sync_uart_device;
+    std::string control_uart_device;
 
     for (int index = 1; index < argc; ++index) {
         std::string option = argv[index];
@@ -1616,6 +1631,10 @@ int main(int argc, char **argv)
         }
         if (option == "--photo-exif-self-test") {
             photo_exif_self_test = true;
+            continue;
+        }
+        if (option == "--control-uart-protocol-self-test") {
+            control_uart_protocol_self_test = true;
             continue;
         }
         if (index + 1 >= argc) {
@@ -1655,6 +1674,8 @@ int main(int argc, char **argv)
                 expected_sensors[camera_id].c_str();
         } else if (option == "--sync-uart") {
             sync_uart_device = value;
+        } else if (option == "--control-uart") {
+            control_uart_device = value;
         } else {
             std::cerr << "Unknown option: " << option << '\n';
             print_usage(argv[0]);
@@ -1687,6 +1708,28 @@ int main(int argc, char **argv)
         std::cout << "PHOTO_EXIF_SELF_TEST_OK detail=\"" << report
                   << "\"\n";
         return EXIT_SUCCESS;
+    }
+    if (control_uart_protocol_self_test) {
+        std::string report;
+        const int uart_result =
+            camera_control_uart::protocol_self_test(&report);
+        if (uart_result != camera_control_uart::OK) {
+            std::cerr << "CONTROL_UART_PROTOCOL_SELF_TEST_FAILED code="
+                      << uart_result << " reason=\"" << report << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "CONTROL_UART_PROTOCOL_SELF_TEST_OK detail=\""
+                  << report << "\"\n";
+        return EXIT_SUCCESS;
+    }
+
+    if (!control_uart_device.empty() &&
+        control_uart_device == sync_uart_device) {
+        std::cerr << "UART_CONFIGURATION_FAILED reason=\"control UART and "
+                     "XVS command UART cannot independently own the same "
+                     "device\" device=\""
+                  << control_uart_device << "\"\n";
+        return EXIT_FAILURE;
     }
 
     std::signal(SIGINT, signal_handler);
@@ -1891,7 +1934,31 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (daemon_mode) {
+    int runtime_result = EXIT_SUCCESS;
+    if (!control_uart_device.empty()) {
+        std::cout << "CONTROL_UART_READY device=\"" << control_uart_device
+                  << "\" baud=115200 format=8N1 protocol=CAM_V1\n";
+        const auto handler = [&](const std::string &command,
+                                 std::string *output) {
+            std::ostringstream capture_output;
+            std::streambuf *saved = std::cout.rdbuf(capture_output.rdbuf());
+            execute_command(backend, capture, uvc, net, photo, xvs, binder,
+                            simulator, command);
+            std::cout.flush();
+            std::cout.rdbuf(saved);
+            *output = capture_output.str();
+        };
+        const int uart_result = camera_control_uart::run(
+            control_uart_device, handler, [] { return g_stop != 0; });
+        if (uart_result != camera_control_uart::OK && !g_stop) {
+            std::cerr << "CONTROL_UART_FAILED device=\""
+                      << control_uart_device << "\" code=" << uart_result
+                      << " reason=\""
+                      << camera_control_uart::strerror(uart_result)
+                      << "\"\n";
+            runtime_result = EXIT_FAILURE;
+        }
+    } else if (daemon_mode) {
         while (!g_stop)
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
     } else {
@@ -1925,5 +1992,5 @@ int main(int argc, char **argv)
     camera_uvc_destroy(uvc);
     camera_backend_destroy(backend);
     std::cout << "CAMERA_BACKEND_STOPPED\n";
-    return EXIT_SUCCESS;
+    return runtime_result;
 }

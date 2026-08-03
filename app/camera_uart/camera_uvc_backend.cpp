@@ -208,6 +208,7 @@ struct camera_uvc_channel {
     std::condition_variable condition;
     std::thread worker;
     bool enabled = false;
+    bool host_open = false;
     bool host_streaming = false;
     bool stop_worker = false;
     int source_camera_id = -1;
@@ -255,10 +256,12 @@ int on_uvc_open(unsigned int index, int width, int height, int fcc, int fps) {
     channel.negotiated_height = height;
     channel.negotiated_fps = fps;
     channel.negotiated_fcc = static_cast<uint32_t>(fcc);
+    channel.host_open = true;
     if (width != static_cast<int>(g_active_backend->config.width) ||
         height != static_cast<int>(g_active_backend->config.height) ||
         fcc != static_cast<int>(kMjpegFourcc)) {
         channel.last_error = CAMERA_UVC_ERR_UNSUPPORTED;
+        channel.host_streaming = false;
         return -1;
     }
     channel.host_streaming = channel.enabled;
@@ -272,7 +275,12 @@ void on_uvc_close(unsigned int index) {
         return;
     camera_uvc_channel &channel = g_active_backend->channels[index];
     std::lock_guard<std::mutex> lock(channel.mutex);
+    channel.host_open = false;
     channel.host_streaming = false;
+    channel.negotiated_width = 0;
+    channel.negotiated_height = 0;
+    channel.negotiated_fps = 0;
+    channel.negotiated_fcc = 0;
     channel.pacing_initialized = false;
     channel.queue.clear();
 }
@@ -280,10 +288,6 @@ void on_uvc_close(unsigned int index) {
 void reset_statistics(camera_uvc_channel *channel) {
     channel->last_error = CAMERA_UVC_OK;
     channel->last_mpp_error = MPP_OK;
-    channel->negotiated_width = 0;
-    channel->negotiated_height = 0;
-    channel->negotiated_fps = 0;
-    channel->negotiated_fcc = 0;
     channel->last_sequence = 0;
     channel->frames_submitted = 0;
     channel->frames_encoded = 0;
@@ -356,7 +360,7 @@ int start_channel(camera_uvc_backend_t *backend, int camera_id) {
     {
         std::lock_guard<std::mutex> lock(channel.mutex);
         if (channel.enabled)
-            return CAMERA_UVC_ERR_STATE;
+            return CAMERA_UVC_OK;
         reset_statistics(&channel);
         channel.source_camera_id = camera_id;
     }
@@ -377,6 +381,7 @@ int start_channel(camera_uvc_backend_t *backend, int camera_id) {
         std::lock_guard<std::mutex> lock(channel.mutex);
         channel.stop_worker = false;
         channel.enabled = true;
+        channel.host_streaming = channel.host_open;
     }
     channel.worker = std::thread(encode_worker, backend, camera_id);
     return CAMERA_UVC_OK;
@@ -468,22 +473,44 @@ int camera_uvc_start_all(camera_uvc_backend_t *backend) {
         return CAMERA_UVC_ERR_ARGUMENT;
     std::lock_guard<std::mutex> control_lock(backend->control_mutex);
 
-    int started = 0;
-    for (; started < CAMERA_UVC_CAMERA_COUNT; ++started) {
-        const int ret = start_channel(backend, started);
+    bool newly_started[CAMERA_UVC_CAMERA_COUNT] = {};
+    for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT; ++camera_id) {
+        bool was_enabled = false;
+        {
+            std::lock_guard<std::mutex> lock(
+                backend->channels[camera_id].mutex);
+            was_enabled = backend->channels[camera_id].enabled;
+        }
+        const int ret = start_channel(backend, camera_id);
         if (ret != CAMERA_UVC_OK) {
-            while (started > 0)
-                stop_channel(&backend->channels[--started]);
+            for (int rollback = 0; rollback < CAMERA_UVC_CAMERA_COUNT;
+                 ++rollback) {
+                if (newly_started[rollback])
+                    stop_channel(&backend->channels[rollback]);
+            }
             return ret;
         }
+        newly_started[camera_id] = !was_enabled;
     }
 
     const int ret = start_control(backend);
     if (ret != CAMERA_UVC_OK) {
-        while (started > 0)
-            stop_channel(&backend->channels[--started]);
+        for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT;
+             ++camera_id) {
+            if (newly_started[camera_id])
+                stop_channel(&backend->channels[camera_id]);
+        }
     }
     return ret;
+}
+
+int camera_uvc_stop_camera(camera_uvc_backend_t *backend, int camera_id) {
+    if (!backend || camera_id < 0 || camera_id >= CAMERA_UVC_CAMERA_COUNT)
+        return CAMERA_UVC_ERR_ARGUMENT;
+
+    std::lock_guard<std::mutex> control_lock(backend->control_mutex);
+    stop_channel(&backend->channels[camera_id]);
+    return CAMERA_UVC_OK;
 }
 
 int camera_uvc_stop(camera_uvc_backend_t *backend) {
