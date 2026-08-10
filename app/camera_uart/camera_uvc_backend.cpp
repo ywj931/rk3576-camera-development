@@ -218,6 +218,7 @@ struct camera_uvc_channel {
     uint32_t negotiated_height = 0;
     uint32_t negotiated_fps = 0;
     uint32_t negotiated_fcc = 0;
+    uint32_t source_fps = CAMERA_UVC_FPS;
     uint32_t last_sequence = 0;
     uint64_t frames_submitted = 0;
     uint64_t frames_encoded = 0;
@@ -259,7 +260,7 @@ int on_uvc_open(unsigned int index, int width, int height, int fcc, int fps) {
     channel.host_open = true;
     if (width != static_cast<int>(g_active_backend->config.width) ||
         height != static_cast<int>(g_active_backend->config.height) ||
-        fcc != static_cast<int>(kMjpegFourcc)) {
+        fcc != static_cast<int>(kMjpegFourcc) || (fps != 2 && fps != 4)) {
         channel.last_error = CAMERA_UVC_ERR_UNSUPPORTED;
         channel.host_streaming = false;
         return -1;
@@ -357,17 +358,19 @@ void encode_worker(camera_uvc_backend_t *backend, int camera_id) {
 
 int start_channel(camera_uvc_backend_t *backend, int camera_id) {
     camera_uvc_channel &channel = backend->channels[camera_id];
+    uint32_t source_fps = 0;
     {
         std::lock_guard<std::mutex> lock(channel.mutex);
         if (channel.enabled)
             return CAMERA_UVC_OK;
         reset_statistics(&channel);
         channel.source_camera_id = camera_id;
+        source_fps = channel.source_fps;
     }
 
     int ret = channel.encoder.initialize(backend->config.width,
                                          backend->config.height,
-                                         backend->config.fps,
+                                         source_fps,
                                          backend->config.jpeg_quality);
     if (ret != MPP_OK) {
         std::lock_guard<std::mutex> lock(channel.mutex);
@@ -427,6 +430,23 @@ int start_control(camera_uvc_backend_t *backend) {
     return CAMERA_UVC_OK;
 }
 
+void shutdown_backend(camera_uvc_backend_t *backend) {
+    std::lock_guard<std::mutex> control_lock(backend->control_mutex);
+    for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT; ++camera_id)
+        stop_channel(&backend->channels[camera_id]);
+    if (backend->control_running)
+        uvc_control_join(UVC_CONTROL_CHECK_STRAIGHT);
+
+    {
+        std::lock_guard<std::mutex> active_lock(g_active_mutex);
+        if (g_active_backend == backend)
+            g_active_backend = nullptr;
+        register_uvc_open_camera_indexed(nullptr);
+        register_uvc_close_camera_indexed(nullptr);
+    }
+    backend->control_running = false;
+}
+
 }  // namespace
 
 void camera_uvc_default_config(camera_uvc_config_t *config) {
@@ -451,6 +471,8 @@ int camera_uvc_create(const camera_uvc_config_t *config,
     if (!backend)
         return CAMERA_UVC_ERR_NOMEM;
     backend->config = *config;
+    for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT; ++camera_id)
+        backend->channels[camera_id].source_fps = config->fps;
     *backend_out = backend;
     return CAMERA_UVC_OK;
 }
@@ -520,17 +542,19 @@ int camera_uvc_stop(camera_uvc_backend_t *backend) {
     std::lock_guard<std::mutex> control_lock(backend->control_mutex);
     for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT; ++camera_id)
         stop_channel(&backend->channels[camera_id]);
-    if (backend->control_running)
-        uvc_control_join(UVC_CONTROL_CHECK_STRAIGHT);
+    return CAMERA_UVC_OK;
+}
 
-    {
-        std::lock_guard<std::mutex> active_lock(g_active_mutex);
-        if (g_active_backend == backend)
-            g_active_backend = nullptr;
-        register_uvc_open_camera_indexed(nullptr);
-        register_uvc_close_camera_indexed(nullptr);
-    }
-    backend->control_running = false;
+int camera_uvc_set_source_fps(camera_uvc_backend_t *backend, int camera_id,
+                              uint32_t fps) {
+    if (!backend || camera_id < 0 || camera_id >= CAMERA_UVC_CAMERA_COUNT)
+        return CAMERA_UVC_ERR_ARGUMENT;
+    if (fps != 2 && fps != 4)
+        return CAMERA_UVC_ERR_UNSUPPORTED;
+    camera_uvc_channel &channel = backend->channels[camera_id];
+    std::lock_guard<std::mutex> lock(channel.mutex);
+    channel.source_fps = fps;
+    channel.pacing_initialized = false;
     return CAMERA_UVC_OK;
 }
 
@@ -559,7 +583,7 @@ int camera_uvc_submit_nv12(camera_uvc_backend_t *backend, int camera_id,
 
         const uint32_t fps = channel.negotiated_fps
                                  ? channel.negotiated_fps
-                                 : backend->config.fps;
+                                 : channel.source_fps;
         if (fps) {
             const auto now = std::chrono::steady_clock::now();
             const auto interval = std::chrono::nanoseconds(1000000000ULL / fps);
@@ -618,7 +642,7 @@ int camera_uvc_get_status(camera_uvc_backend_t *backend, int camera_id,
     status->last_mpp_error = channel.last_mpp_error;
     status->width = backend->config.width;
     status->height = backend->config.height;
-    status->fps = backend->config.fps;
+    status->fps = channel.source_fps;
     status->negotiated_width = channel.negotiated_width;
     status->negotiated_height = channel.negotiated_height;
     status->negotiated_fps = channel.negotiated_fps;
@@ -639,7 +663,7 @@ int camera_uvc_get_status(camera_uvc_backend_t *backend, int camera_id,
 void camera_uvc_destroy(camera_uvc_backend_t *backend) {
     if (!backend)
         return;
-    camera_uvc_stop(backend);
+    shutdown_backend(backend);
     delete backend;
 }
 

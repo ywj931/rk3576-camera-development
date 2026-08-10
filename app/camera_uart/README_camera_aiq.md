@@ -5,8 +5,8 @@
 - cam0/cam1 两路独立 RKAIQ context；
 - cam0/cam1 两路 V4L2 NV12M 采集线程；
 - 两路独立的异步保存线程和状态；
-- cam0/cam1 两路独立 4000x3000@10fps MJPEG UVC 输出；
-- cam0/cam1 两路独立 4000x3000@10fps HTTP MJPEG 网络输出；
+- cam0/cam1 两路独立 4000x3000@2/4fps MJPEG UVC 输出；
+- cam0/cam1 两路独立 HTTP MJPEG 网络输出，实际更新率跟随各自 2/4 Hz 相机源；
 - 曝光、模拟增益、帧率、开始/停止出流、开始/停止保存和状态查询命令；
 - 一条 `/dev/ttyS9` 115200、8N1 全双工链路，统一承载相机控制、MCU XVS
   命令/应答、PPS/GPRMC/Trigger 事件；
@@ -20,7 +20,7 @@ IMX586 已经在同一触发沿曝光。模拟与 MCU 迁移说明见
 
 ## 文件和资源归属
 
-- `camera_backend.h/.cpp`：双路 RKAIQ 初始化、独立曝光、独立模拟增益、帧率和 AIQ 状态。
+- `camera_backend.h/.cpp`：双路 RKAIQ 初始化、独立曝光/增益，以及 IMX586 XVS 2/4 Hz 独立分频和回读。
 - `capture_backend.h/.cpp`：双路 V4L2 出流、帧统计、异步 NV12 保存和保存状态。
 - `camera_uvc_backend.h/.cpp`：cam0/cam1 独立帧队列、MPP MJPEG 编码和 UVC 状态。
 - `camera_net_backend.h/.cpp`：cam0/cam1 独立最新帧队列、10 fps 主动节流、
@@ -91,14 +91,26 @@ make -f Makefile.camera_aiq aarch64
 `http://<board-ip>:8080/cam1`，或用 `http://<board-ip>:8080/` 同时查看两路。
 开机常驻配置和协议说明见 `NETWORK_HTTP_MJPEG.md`。
 
+未接 MCU，同时常驻双路 UVC、双路 HTTP 和 RNDIS 网卡时运行：
+
+```sh
+./camera_aiq_test --all-daemon
+```
+
+`camera-uvc.service` 当前使用该模式。程序只启动一次两路采集，再把每一帧同时送给
+UVC 和 HTTP；RNDIS Gadget 由 `usbdevice.service` 独立常驻。因此停止或恢复 UVC
+送帧不会撤下 USB 网卡，电脑可继续通过 `192.168.55.1` 访问 HTTP 和 SSH。
+
 双路 UVC 并连接最终 MCU 时运行：
 
 ```sh
-./camera_aiq_test --uvc-daemon --uart /dev/ttyS9 --sync-timer-hz 1000000
+./camera_aiq_test --all-daemon --uart /dev/ttyS9 --sync-timer-hz 1000000 \
+  --xvs-autostart-hz 4 --xvs-low-pulse-us 10
 ```
 
-该模式已经写入 `camera-uvc.service`。服务启动后，一个进程同时持有两路相机、
-两路 UVC、网络和保存后端；UART 命令不会再启动第二个相机程序。
+接入 MCU 后再把该命令写入 `camera-uvc.service`。服务启动后，一个进程同时持有两路
+相机、两路 UVC、网络和保存后端；UART 命令不会再启动第二个相机程序。未接 MCU 时
+不要传 `--uart` 或 `--xvs-autostart-hz`，否则程序会因为 MCU 应答超时而退出。
 
 不启动 UVC、只进入控制台联调同一个 MCU 时运行：
 
@@ -172,6 +184,11 @@ quit
   camera0 的送帧与编码，camera1 和两个 USB 接口保持不变；主机未打开视频流时，
   `skipped_no_host` 增长是正常状态。完整抓图流程见
   `DUAL_UVC_4000X3000_TEST_20260731.md`。
+- `uvc-stop all` 是软停止：只停止两路 UVC 编码和送帧，UVC 控制端点、configfs
+  复合 Gadget 和 RNDIS 网卡继续存在，再执行 `uvc-start all` 可直接恢复且不会触发
+  USB 重新枚举。`quit` 会关闭程序持有的 UVC 文件描述符和 HTTP 服务，但
+  `usbdevice.service` 仍保留 Gadget/RNDIS。正常运行期间不要执行 `usbdevice stop`、
+  `usbdevice restart` 或手工清空 Gadget 的 `UDC`，这些操作会让 RNDIS 和 UVC 一起掉线。
 - `net-start CAMERA_ID` 要求对应相机已经出流，camera0/camera1 分别固定发布
   `http://<board-ip>:8080/cam0` 和 `http://<board-ip>:8080/cam1`。采集通常约
   30 fps，各路网络后端主动只编码每 100 ms 的最新一帧；因此 `queue_drops`
@@ -228,7 +245,7 @@ stream-start all
 wait 3000
 status all
 
-fps 0 2
+fps 0 4
 fps 1 2
 wait 5000
 status all

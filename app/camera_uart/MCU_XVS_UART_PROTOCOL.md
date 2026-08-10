@@ -61,7 +61,7 @@ $NACK,<seq>,<command>,ERROR=<reason>*<CRC16>\r\n
 | `XVS,seq,PING` | 通信检查 | `PONG` |
 | `XVS,seq,IDLE` | 停定时器并主动输出高 | `IDLE` |
 | `XVS,seq,START,4000,10` | 连续 4 Hz、低 10 us | `START` |
-| `XVS,seq,START,2000,10` | 连续 2 Hz、低 10 us | `START` |
+| `XVS,seq,START,2000,10` | 旧版全局 2 Hz 诊断；会同时影响两路，不用于独立切换 | `START` |
 | `XVS,seq,COUNT,4000,10,1000` | 精确输出 1000 个脉冲 | `COUNT` |
 | `XVS,seq,STOP` | 停定时器并主动输出高 | `STOP` |
 | `XVS,seq,STATUS` | 查询 MCU 实际状态 | `STATUS` |
@@ -72,6 +72,10 @@ $NACK,<seq>,<command>,ERROR=<reason>*<CRC16>\r\n
 ACK,seq,STATUS,STATE=IDLE,FREQ_MHZ=4000,LOW_US=10,
 PULSE_COUNT=1000,LAST_TRIGGER_ID=1000
 ```
+
+最终双路独立模式中，共享 XVS 必须始终运行 `START,4000,10`。cam0/cam1 的
+2 Hz 由各自 IMX586 输入分频完成，不能通过 `START,2000,10` 切换，否则两路
+都会同时变成 2 Hz。
 
 `PULSE_COUNT` 是 MCU 上电后的累计实际输出脉冲数，`LAST_TRIGGER_ID` 每个
 已输出下降沿加一。ACK 表示命令已经被 MCU 接受；定量输出是否完成要查询
@@ -100,8 +104,8 @@ $EVT,XVS,<trigger_id>,<pps_id>,<timer_tick>*<CRC16>\r\n
 
 不要用 UART 中断里的延时或主循环翻转 GPIO。使用硬件定时器/PWM：
 
-- 4 Hz：周期 250000 us，低电平 10 us，高电平 249990 us。
-- 2 Hz：周期 500000 us，低电平 10 us，高电平 499990 us。
+- 正式共享时基 4 Hz：周期 250000 us，低电平 10 us，高电平 249990 us。
+- 2 Hz 全局输出仅保留作诊断；正式模式由目标 IMX586 对 4 Hz 输入做 1/2 分频。
 - 下降沿定义为一个新的 `trigger_id`。
 - 捕获 GNSS PPS 有效边沿时锁存高精度计数器，递增 `pps_id` 并上报 `EVT,PPS`。
 - PPS 后到达的 GPRMC/GNRMC 报文必须带上刚才的 `pps_id`；下一 PPS 的 UTC
@@ -160,8 +164,9 @@ sync-stop
 stream-stop all
 ```
 
-4 Hz 的 1000 个脉冲约需 250 秒；2 Hz 约需 500 秒。软件验收应看到 MCU
-累计脉冲准确增加、两路各增加 1000 帧、两路帧数差为 0、
+4 Hz 的 1000 个脉冲约需 250 秒。两路都设为 4 Hz 时，应各增加约 1000 帧；
+某一路设为 2 Hz 时，该路应增加约 500 帧，另一条 4 Hz 路仍增加约 1000 帧。
+如需验收 2 Hz 路的 1000 帧，应保持共享 4 Hz 并发送约 2000 个脉冲。软件验收还应满足
 `sequence_drops=0`，停止后帧数不再增长。`sync-status` 中的 `delta_ns` 仍是
 ISP/V4L2 缓冲时间差，只能辅助诊断。最终曝光起点误差仍需示波器同时观察
 `FSYNC_CAM`、`PPS_OUT`、cam0 pin26 和 cam1 pin26。

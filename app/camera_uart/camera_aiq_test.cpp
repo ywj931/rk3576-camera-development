@@ -105,6 +105,8 @@ void print_usage(const char *program)
         << "  --iq1 DIRECTORY     camera 1 IQ directory\n"
         << "  --params0 DEVICE    camera 0 rkisp-input-params node\n"
         << "  --params1 DEVICE    camera 1 rkisp-input-params node\n"
+        << "  --subdev0 DEVICE    optional camera 0 sensor subdevice override\n"
+        << "  --subdev1 DEVICE    optional camera 1 sensor subdevice override\n"
         << "  --video0 DEVICE     camera 0 V4L2 capture node\n"
         << "  --video1 DEVICE     camera 1 V4L2 capture node\n"
         << "  --sensor0 TEXT      expected camera 0 sensor text\n"
@@ -112,15 +114,18 @@ void print_usage(const char *program)
         << "  --autostart         start capture and HTTP output for both cameras\n"
         << "  --daemon            autostart both cameras and run without console input\n"
         << "  --uvc-daemon        start both cameras and two UVC outputs without console input\n"
+        << "  --all-daemon        start capture, HTTP and two UVC outputs without console input\n"
         << "  --uart DEVICE      unified camera control, XVS and time-event UART (recommended)\n"
         << "  --control-uart DEVICE  legacy separate camera control UART\n"
         << "  --control-uart-protocol-self-test  test control protocol without hardware\n"
         << "  --sync-uart DEVICE  legacy separate MCU XVS/time-event UART\n"
         << "  --sync-timer-hz HZ  MCU high-resolution timer frequency (default: 1000000)\n"
+        << "  --xvs-autostart-hz 4  start the shared 4 Hz XVS timebase after capture starts\n"
+        << "  --xvs-low-pulse-us US  autostart XVS low width (default: 10)\n"
         << "  --sync-protocol-self-test  test XVS protocol without camera hardware\n"
         << "  --sync-bind-self-test  test simulated trigger/frame binding without camera hardware\n"
         << "  --photo-exif-self-test  test JPEG EXIF generation without camera hardware\n"
-        << "  UVC mode is fixed at 4000x3000 MJPEG 10 fps per camera\n"
+        << "  UVC mode is 4000x3000 MJPEG; both cameras support 2 or 4 fps\n"
         << "  network mode is fixed at 4000x3000 MJPEG 10 fps per camera, HTTP port 8080\n"
         << "  --help              show this help\n";
 }
@@ -133,6 +138,7 @@ void print_commands()
         << "  auto CAMERA_ID\n"
         << "  exposure CAMERA_ID EXPOSURE_US\n"
         << "  gain CAMERA_ID GAIN_X1000\n"
+        << "  iso CAMERA_ID ISO\n"
         << "  fps CAMERA_ID FPS\n"
         << "  stream-start CAMERA_ID|all\n"
         << "  stream-stop CAMERA_ID|all\n"
@@ -187,12 +193,28 @@ void print_status(camera_backend_t *backend, int camera_id)
               << " query_valid=" << status.query_valid
               << " exposure_us=" << status.exposure_us
               << " gain_x1000=" << status.gain_x1000
+              << " digital_gain_x1000=" << status.digital_gain_x1000
+              << " isp_dgain_x1000=" << status.isp_dgain_x1000
               << " iso=" << status.iso
+              << " aiq_iso=" << status.aiq_iso
+              << " iso_estimated=" << status.iso_estimated
               << " fps_x1000=" << status.fps_x1000
+              << " requested_exposure_us="
+              << status.requested_exposure_us
+              << " requested_gain_x1000="
+              << status.requested_gain_x1000
+              << " requested_iso=" << status.requested_iso
+              << " requested_fps_x1000="
+              << status.requested_fps_x1000
+              << " xvs_config_valid=" << status.xvs_config_valid
+              << " xvs_input_thin=" << status.xvs_input_thin
+              << " manual_settings_verified="
+              << status.manual_settings_verified
               << " mean_luma=" << status.mean_luma
               << " converged=" << status.converged
               << " last_aiq_error=" << status.last_aiq_error
               << " sensor=\"" << status.sensor_name << "\""
+              << " sensor_device=\"" << status.sensor_device << "\""
               << " iq=\"" << status.iq_dir << "\"\n";
 }
 
@@ -213,6 +235,11 @@ void print_capture_status(capture_backend_t *capture, int camera_id)
               << " saving=" << status.saving
               << " size=" << status.width << 'x' << status.height
               << " fps_x1000=" << status.fps_x1000
+              << " fps_target_x1000=" << status.fps_target_x1000
+              << " fps_stable=" << status.fps_stable
+              << " fps_window_frames=" << status.fps_window_frames
+              << " fps_window_duration_ns="
+              << status.fps_window_duration_ns
               << " frames=" << status.frames_captured
               << " sequence_drops=" << status.frames_dropped
               << " saved=" << status.frames_saved
@@ -770,16 +797,12 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
                                      &metadata.sensor_response_offset_ns);
     metadata.exposure_start_realtime_ns = add_signed_ns(
         metadata.trigger_realtime_ns, metadata.sensor_response_offset_ns);
-    if (status_result == CAMERA_BACKEND_OK) {
+    if (status_result == CAMERA_BACKEND_OK && camera_status.query_valid) {
         metadata.exposure_us = camera_status.exposure_us;
         metadata.gain_x1000 = camera_status.gain_x1000;
-        if (camera_status.iso > 0) {
-            metadata.iso = static_cast<uint32_t>(camera_status.iso);
-        } else {
-            metadata.iso =
-                std::max<uint32_t>(1, (camera_status.gain_x1000 + 5) / 10);
-            metadata.iso_estimated = 1;
-        }
+        metadata.iso =
+            std::max<uint32_t>(1, static_cast<uint32_t>(camera_status.iso));
+        metadata.iso_estimated = camera_status.iso_estimated;
     }
     metadata.exposure_center_realtime_ns =
         metadata.exposure_start_realtime_ns +
@@ -791,8 +814,11 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
                   sizeof(metadata.trigger_source), "%s", match.source);
     std::snprintf(metadata.exposure_source,
                   sizeof(metadata.exposure_source), "%s",
-                  status_result == CAMERA_BACKEND_OK
-                      ? "RKAIQ_LATEST_NOT_FRAME_BOUND"
+                  status_result == CAMERA_BACKEND_OK &&
+                          camera_status.query_valid
+                      ? (camera_status.manual_settings_verified
+                             ? "MANUAL_VERIFIED_AT_DQBUF"
+                             : "RKAIQ_QUERY_AT_DQBUF")
                       : "UNAVAILABLE");
     camera_photo_submit_nv12(outputs->photo, camera_id, plane0, plane0_size,
                              plane1, plane1_size, &metadata);
@@ -827,6 +853,195 @@ void invalid_command(const std::string &command, const char *usage)
 {
     std::cout << "ERROR command=" << command << " reason=\"invalid syntax\""
               << " usage=\"" << usage << "\"\n";
+}
+
+bool wait_camera_started(camera_backend_t *backend, int camera_id,
+                         bool expected_started,
+                         std::chrono::milliseconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        camera_backend_status_t status = {};
+        camera_backend_get_status(backend, camera_id, &status);
+        if ((status.started != 0) == expected_started)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+void switch_xvs_camera_fps(camera_backend_t *backend,
+                           capture_backend_t *capture,
+                           camera_uvc_backend_t *uvc,
+                           camera_photo_backend_t *photo, int camera_id,
+                           uint32_t fps)
+{
+    if (fps != 2 && fps != 4) {
+        std::cout << "ERROR command=fps camera_id=" << camera_id
+                  << " reason=\"XVS mode supports only 2 or 4 fps\"\n";
+        return;
+    }
+
+    capture_backend_status_t before = {};
+    const int capture_result =
+        capture_backend_get_status(capture, camera_id, &before);
+    if (capture_result != CAPTURE_BACKEND_OK) {
+        print_capture_result("fps", camera_id, capture_result);
+        return;
+    }
+    if (before.saving || camera_photo_is_enabled(photo, camera_id)) {
+        std::cout << "ERROR command=fps camera_id=" << camera_id
+                  << " reason=\"stop save/photo on this camera before changing XVS fps\"\n";
+        return;
+    }
+
+    uint32_t previous_fps = 0;
+    const int query_xvs_result =
+        camera_backend_get_xvs_fps(backend, camera_id, &previous_fps);
+    if (query_xvs_result != CAMERA_BACKEND_OK) {
+        print_result("fps-xvs-query", camera_id, query_xvs_result);
+        return;
+    }
+    if (previous_fps == fps) {
+        camera_uvc_set_source_fps(uvc, camera_id, fps);
+        if (before.running)
+            capture_backend_reset_fps_window(capture, camera_id, fps);
+    }
+
+    camera_backend_status_t preserved = {};
+    const bool preserve_manual =
+        before.running &&
+        camera_backend_get_status(backend, camera_id, &preserved) ==
+            CAMERA_BACKEND_OK &&
+        preserved.manual_mode && preserved.query_valid;
+    const int other_id = camera_id == 0 ? 1 : 0;
+    capture_backend_status_t other_before = {};
+    capture_backend_get_status(capture, other_id, &other_before);
+
+    if (before.running && previous_fps != fps) {
+        const int stop_result =
+            capture_backend_stop_stream(capture, camera_id);
+        if (stop_result != CAPTURE_BACKEND_OK) {
+            print_capture_result("fps-stop", camera_id, stop_result);
+            return;
+        }
+        if (!wait_camera_started(backend, camera_id, false,
+                                 std::chrono::seconds(3))) {
+            std::cout << "ERROR command=fps camera_id=" << camera_id
+                      << " reason=\"AIQ did not enter standby\"\n";
+            capture_backend_start_stream(capture, camera_id);
+            return;
+        }
+    }
+
+    bool manual_parameters_restored = true;
+    if (previous_fps != fps) {
+        const int set_result =
+            camera_backend_set_xvs_fps(backend, camera_id, fps);
+        if (set_result != CAMERA_BACKEND_OK) {
+            print_result("fps-xvs-thin", camera_id, set_result);
+            if (before.running)
+                capture_backend_start_stream(capture, camera_id);
+            return;
+        }
+        camera_uvc_set_source_fps(uvc, camera_id, fps);
+    }
+
+    if (!before.running) {
+        std::cout << "OK command=fps camera_id=" << camera_id
+                  << " configured_fps_x1000=" << fps * 1000U
+                  << " stream_restart=0 measured=0 xvs_master_hz=4\n";
+        return;
+    }
+
+    if (previous_fps != fps) {
+        const int start_result =
+            capture_backend_start_stream(capture, camera_id);
+        if (start_result != CAPTURE_BACKEND_OK) {
+            camera_backend_set_xvs_fps(backend, camera_id, previous_fps);
+            camera_uvc_set_source_fps(uvc, camera_id, previous_fps);
+            capture_backend_start_stream(capture, camera_id);
+            print_capture_result("fps-start", camera_id, start_result);
+            return;
+        }
+        if (!wait_camera_started(backend, camera_id, true,
+                                 std::chrono::seconds(5))) {
+            std::cout << "ERROR command=fps camera_id=" << camera_id
+                      << " reason=\"AIQ did not restart\"\n";
+            return;
+        }
+        if (preserve_manual) {
+            const int exposure_result = camera_backend_set_exposure(
+                backend, camera_id, preserved.exposure_us);
+            const int gain_result = camera_backend_set_gain(
+                backend, camera_id, preserved.gain_x1000);
+            manual_parameters_restored =
+                exposure_result == CAMERA_BACKEND_OK &&
+                gain_result == CAMERA_BACKEND_OK;
+            if (!manual_parameters_restored) {
+                std::cout << "ERROR command=fps camera_id=" << camera_id
+                          << " reason=\"manual exposure/gain restore failed\""
+                          << " exposure_result=" << exposure_result
+                          << " gain_result=" << gain_result << '\n';
+                return;
+            }
+        }
+        capture_backend_reset_fps_window(capture, camera_id, fps);
+    }
+
+    capture_backend_status_t measured = {};
+    bool stable = false;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (capture_backend_get_status(capture, camera_id, &measured) !=
+            CAPTURE_BACKEND_OK)
+            continue;
+        const uint32_t requested_x1000 = fps * 1000U;
+        const uint32_t tolerance_x1000 =
+            std::max(100U, requested_x1000 / 20U);
+        const uint32_t difference =
+            measured.fps_x1000 >= requested_x1000
+                ? measured.fps_x1000 - requested_x1000
+                : requested_x1000 - measured.fps_x1000;
+        if (measured.fps_stable && difference <= tolerance_x1000) {
+            stable = true;
+            break;
+        }
+    }
+
+    capture_backend_status_t other_after = {};
+    capture_backend_get_status(capture, other_id, &other_after);
+    const bool other_continued =
+        other_before.running && other_after.running &&
+        other_after.frames_captured > other_before.frames_captured;
+    const bool other_ok = !other_before.running || other_continued;
+    if (!stable || !other_ok) {
+        std::cout << "ERROR command=fps camera_id=" << camera_id
+                  << " reason=\""
+                  << (!stable ? "target fps did not stabilize"
+                              : "the other camera stopped advancing")
+                  << "\" requested_fps_x1000=" << fps * 1000U
+                  << " measured_fps_x1000=" << measured.fps_x1000
+                  << " other_camera_id=" << other_id
+                  << " other_frames_before=" << other_before.frames_captured
+                  << " other_frames_after=" << other_after.frames_captured
+                  << '\n';
+        return;
+    }
+    std::cout << "OK command=fps camera_id=" << camera_id
+              << " requested_fps_x1000=" << fps * 1000U
+              << " measured_fps_x1000=" << measured.fps_x1000
+              << " fps_stable=1 xvs_master_hz=4"
+              << " sensor_restart=" << (previous_fps != fps ? 1 : 0)
+              << " other_camera_id=" << other_id
+              << " other_camera_was_running=" << other_before.running
+              << " other_camera_continued="
+              << (other_before.running ? (other_continued ? 1 : 0) : -1)
+              << " manual_parameters_restored="
+              << (manual_parameters_restored ? 1 : 0)
+              << '\n';
 }
 
 bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
@@ -962,7 +1177,8 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             std::cout << "OK command=photo-start camera_id=" << camera_id
                       << " output_dir=\"" << output_dir << "\""
                       << " trigger_required=1"
-                      << " exposure_source=RKAIQ_LATEST_NOT_FRAME_BOUND\n";
+                      << " frame_parameter_policy="
+                         "MANUAL_VERIFIED_AT_DQBUF\n";
         } else {
             std::cout << "ERROR command=photo-start camera_id=" << camera_id
                       << " code=" << result << " reason=\""
@@ -1107,7 +1323,8 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
                                ? camera_uvc_stop(uvc)
                                : camera_uvc_stop_camera(uvc, camera_id);
         if (result == CAMERA_UVC_OK) {
-            std::cout << "OK command=uvc-stop target=" << target << '\n';
+            std::cout << "OK command=uvc-stop target=" << target
+                      << " usb_gadget=kept rndis=kept\n";
         } else {
             std::cout << "ERROR command=uvc-stop target=" << target
                       << " code=" << result
@@ -1610,6 +1827,23 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
         return true;
     }
 
+    if (command == "iso") {
+        std::string camera_text;
+        std::string iso_text;
+        std::string extra;
+        int camera_id = -1;
+        uint32_t iso = 0;
+        if (!(stream >> camera_text >> iso_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id) ||
+            !parse_u32(iso_text, &iso)) {
+            invalid_command(command, "iso CAMERA_ID ISO");
+            return true;
+        }
+        print_result(command.c_str(), camera_id,
+                     camera_backend_set_iso(backend, camera_id, iso));
+        return true;
+    }
+
     if (command == "fps") {
         std::string camera_text;
         std::string fps_text;
@@ -1622,8 +1856,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             invalid_command(command, "fps CAMERA_ID FPS");
             return true;
         }
-        print_result(command.c_str(), camera_id,
-                     camera_backend_set_fps(backend, camera_id, fps));
+        switch_xvs_camera_fps(backend, capture, uvc, photo, camera_id, fps);
         return true;
     }
 
@@ -1731,7 +1964,10 @@ bool autostart_http_outputs(capture_backend_t *capture,
 }
 
 bool autostart_uvc_output(capture_backend_t *capture,
-                          camera_uvc_backend_t *uvc)
+                          camera_uvc_backend_t *uvc,
+                          xvs_uart_controller_t *xvs,
+                          uint32_t xvs_frequency_hz,
+                          uint32_t xvs_low_pulse_us)
 {
     int started = 0;
     for (; started < CAMERA_UVC_CAMERA_COUNT; ++started) {
@@ -1746,11 +1982,32 @@ bool autostart_uvc_output(capture_backend_t *capture,
         }
     }
 
+    bool xvs_started = false;
+    if (xvs_frequency_hz) {
+        const int sync_result =
+            xvs_uart_start(xvs, xvs_frequency_hz, xvs_low_pulse_us);
+        if (sync_result != XVS_UART_OK) {
+            std::cerr << "UVC_AUTOSTART_FAILED stage=xvs code="
+                      << sync_result << " reason=\""
+                      << xvs_uart_strerror(sync_result) << "\"\n";
+            for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT;
+                 ++camera_id)
+                capture_backend_stop_stream(capture, camera_id);
+            return false;
+        }
+        xvs_started = true;
+        std::cout << "XVS_AUTOSTART_READY frequency_hz="
+                  << xvs_frequency_hz
+                  << " low_pulse_us=" << xvs_low_pulse_us << '\n';
+    }
+
     const int result = camera_uvc_start_all(uvc);
     if (result != CAMERA_UVC_OK) {
         std::cerr << "UVC_AUTOSTART_FAILED stage=uvc target=all code="
                   << result << " reason=\""
                   << camera_uvc_strerror(result) << "\"\n";
+        if (xvs_started)
+            xvs_uart_stop(xvs);
         for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT;
              ++camera_id)
             capture_backend_stop_stream(capture, camera_id);
@@ -1758,7 +2015,87 @@ bool autostart_uvc_output(capture_backend_t *capture,
     }
 
     std::cout << "UVC_AUTOSTART_READY cameras=0,1"
-              << " outputs=2 mode=4000x3000@10fps/MJPEG\n";
+              << " outputs=2 mode=4000x3000@2-or-4fps/MJPEG\n";
+    return true;
+}
+
+bool autostart_all_outputs(capture_backend_t *capture,
+                           camera_net_backend_t *net,
+                           camera_uvc_backend_t *uvc,
+                           xvs_uart_controller_t *xvs,
+                           uint32_t xvs_frequency_hz,
+                           uint32_t xvs_low_pulse_us)
+{
+    int captures_started = 0;
+    for (int camera_id = 0; camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+         ++camera_id) {
+        const int result = capture_backend_start_stream(capture, camera_id);
+        if (result != CAPTURE_BACKEND_OK) {
+            std::cerr << "ALL_AUTOSTART_FAILED stage=capture camera_id="
+                      << camera_id << " code=" << result << " reason=\""
+                      << capture_backend_strerror(result) << "\"\n";
+            for (int started = 0; started < captures_started; ++started)
+                capture_backend_stop_stream(capture, started);
+            return false;
+        }
+        captures_started++;
+    }
+
+    bool xvs_started = false;
+    if (xvs_frequency_hz) {
+        const int result =
+            xvs_uart_start(xvs, xvs_frequency_hz, xvs_low_pulse_us);
+        if (result != XVS_UART_OK) {
+            std::cerr << "ALL_AUTOSTART_FAILED stage=xvs code=" << result
+                      << " reason=\"" << xvs_uart_strerror(result)
+                      << "\"\n";
+            for (int camera_id = 0; camera_id < captures_started; ++camera_id)
+                capture_backend_stop_stream(capture, camera_id);
+            return false;
+        }
+        xvs_started = true;
+        std::cout << "XVS_AUTOSTART_READY frequency_hz="
+                  << xvs_frequency_hz
+                  << " low_pulse_us=" << xvs_low_pulse_us << '\n';
+    }
+
+    int networks_started = 0;
+    for (int camera_id = 0; camera_id < CAMERA_NET_CAMERA_COUNT;
+         ++camera_id) {
+        const int result = camera_net_start(net, camera_id);
+        if (result != CAMERA_NET_OK) {
+            std::cerr << "ALL_AUTOSTART_FAILED stage=network camera_id="
+                      << camera_id << " code=" << result << " reason=\""
+                      << camera_net_strerror(result) << "\"\n";
+            for (int started = 0; started < networks_started; ++started)
+                camera_net_stop_camera(net, started);
+            if (xvs_started)
+                xvs_uart_stop(xvs);
+            for (int camera_id = 0; camera_id < captures_started; ++camera_id)
+                capture_backend_stop_stream(capture, camera_id);
+            return false;
+        }
+        networks_started++;
+    }
+
+    const int result = camera_uvc_start_all(uvc);
+    if (result != CAMERA_UVC_OK) {
+        std::cerr << "ALL_AUTOSTART_FAILED stage=uvc target=all code="
+                  << result << " reason=\"" << camera_uvc_strerror(result)
+                  << "\"\n";
+        for (int camera_id = 0; camera_id < networks_started; ++camera_id)
+            camera_net_stop_camera(net, camera_id);
+        if (xvs_started)
+            xvs_uart_stop(xvs);
+        for (int camera_id = 0; camera_id < captures_started; ++camera_id)
+            capture_backend_stop_stream(capture, camera_id);
+        return false;
+    }
+
+    std::cout << "ALL_AUTOSTART_READY cameras=0,1"
+              << " uvc=4000x3000@2-or-4fps/MJPEG"
+              << " http=http://<board-ip>:8080/{cam0,cam1}"
+              << " rndis=lifecycle-owned-by-usbdevice.service\n";
     return true;
 }
 
@@ -1775,14 +2112,18 @@ int main(int argc, char **argv)
     std::string iq_dirs[CAMERA_BACKEND_CAMERA_COUNT];
     std::string expected_sensors[CAMERA_BACKEND_CAMERA_COUNT];
     std::string params_devices[CAMERA_BACKEND_CAMERA_COUNT];
+    std::string sensor_devices[CAMERA_BACKEND_CAMERA_COUNT];
     std::string video_devices[CAPTURE_BACKEND_CAMERA_COUNT];
     bool autostart = false;
     bool uvc_autostart = false;
+    bool all_outputs_autostart = false;
     bool daemon_mode = false;
     bool sync_protocol_self_test = false;
     bool sync_bind_self_test = false;
     bool photo_exif_self_test = false;
     bool control_uart_protocol_self_test = false;
+    uint32_t xvs_autostart_hz = 0;
+    uint32_t xvs_low_pulse_us = 10;
     std::string unified_uart_device;
     std::string sync_uart_device;
     std::string control_uart_device;
@@ -1805,6 +2146,11 @@ int main(int argc, char **argv)
         }
         if (option == "--uvc-daemon") {
             uvc_autostart = true;
+            daemon_mode = true;
+            continue;
+        }
+        if (option == "--all-daemon") {
+            all_outputs_autostart = true;
             daemon_mode = true;
             continue;
         }
@@ -1849,6 +2195,11 @@ int main(int argc, char **argv)
             int camera_id = option == "--params0" ? 0 : 1;
             params_devices[camera_id] = value;
             config.params_device[camera_id] = params_devices[camera_id].c_str();
+        } else if (option == "--subdev0" || option == "--subdev1") {
+            int camera_id = option == "--subdev0" ? 0 : 1;
+            sensor_devices[camera_id] = value;
+            config.sensor_device[camera_id] =
+                sensor_devices[camera_id].c_str();
         } else if (option == "--video0" || option == "--video1") {
             int camera_id = option == "--video0" ? 0 : 1;
             video_devices[camera_id] = value;
@@ -1869,6 +2220,19 @@ int main(int argc, char **argv)
                 time_sync_config.timer_frequency_hz > 1000000000ULL) {
                 std::cerr << "Invalid MCU timer frequency: " << value
                           << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--xvs-autostart-hz") {
+            if (!parse_u32(value, &xvs_autostart_hz) ||
+                xvs_autostart_hz != 4) {
+                std::cerr << "Invalid XVS autostart frequency: " << value
+                          << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--xvs-low-pulse-us") {
+            if (!parse_u32(value, &xvs_low_pulse_us) ||
+                !xvs_low_pulse_us || xvs_low_pulse_us > 1000) {
+                std::cerr << "Invalid XVS low pulse width: " << value << '\n';
                 return EXIT_FAILURE;
             }
         } else if (option == "--control-uart") {
@@ -1894,6 +2258,17 @@ int main(int argc, char **argv)
     }
     const bool shared_uart = !sync_uart_device.empty() &&
                              sync_uart_device == control_uart_device;
+    if (xvs_autostart_hz && sync_uart_device.empty()) {
+        std::cerr << "XVS_AUTOSTART_CONFIGURATION_FAILED reason=\""
+                     "--xvs-autostart-hz requires --uart or --sync-uart\"\n";
+        return EXIT_FAILURE;
+    }
+    if (xvs_autostart_hz && !uvc_autostart && !all_outputs_autostart) {
+        std::cerr << "XVS_AUTOSTART_CONFIGURATION_FAILED reason=\""
+                     "--xvs-autostart-hz requires --uvc-daemon or "
+                     "--all-daemon\"\n";
+        return EXIT_FAILURE;
+    }
 
     if (sync_protocol_self_test) {
         const int protocol_result = xvs_uart_protocol_self_test();
@@ -2150,13 +2525,15 @@ int main(int argc, char **argv)
     }
 
     std::cout << "CAMERA_BACKEND_READY cameras=" << CAMERA_BACKEND_CAMERA_COUNT
-              << " uvc=2x4000x3000@10fps/MJPEG sources=camera0,camera1"
-              << " net=4000x3000@10fps/MJPEG"
+              << " uvc=cam0,cam1:4000x3000@2-or-4fps/MJPEG"
+              << " net=4000x3000/MJPEG source_rate=per-camera:2-or-4fps"
               << " HTTP=:8080/{cam0,cam1} sources=camera0,camera1\n";
     if (!daemon_mode)
         print_commands();
 
-    if (autostart && !autostart_http_outputs(capture, net)) {
+    if (all_outputs_autostart &&
+        !autostart_all_outputs(capture, net, uvc, xvs, xvs_autostart_hz,
+                               xvs_low_pulse_us)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
         time_sync_destroy(time_sync);
@@ -2169,7 +2546,23 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (uvc_autostart && !autostart_uvc_output(capture, uvc)) {
+    if (autostart && !all_outputs_autostart &&
+        !autostart_http_outputs(capture, net)) {
+        xvs_uart_destroy(xvs);
+        trigger_simulator_destroy(simulator);
+        time_sync_destroy(time_sync);
+        capture_backend_destroy(capture);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    if (uvc_autostart && !all_outputs_autostart &&
+        !autostart_uvc_output(capture, uvc, xvs, xvs_autostart_hz,
+                              xvs_low_pulse_us)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
         time_sync_destroy(time_sync);

@@ -10,7 +10,7 @@ extern "C" {
 
 #define CAMERA_UVC_WIDTH 4000
 #define CAMERA_UVC_HEIGHT 3000
-#define CAMERA_UVC_FPS 10
+#define CAMERA_UVC_FPS 4
 #define CAMERA_UVC_CAMERA_COUNT 2
 
 typedef struct camera_uvc_backend camera_uvc_backend_t;
@@ -65,7 +65,10 @@ void camera_uvc_destroy(camera_uvc_backend_t *backend);
 int camera_uvc_start(camera_uvc_backend_t *backend, int camera_id);
 int camera_uvc_start_all(camera_uvc_backend_t *backend);
 int camera_uvc_stop_camera(camera_uvc_backend_t *backend, int camera_id);
+/* Stops both video producers while keeping UVC control and USB Gadget alive. */
 int camera_uvc_stop(camera_uvc_backend_t *backend);
+int camera_uvc_set_source_fps(camera_uvc_backend_t *backend, int camera_id,
+                              uint32_t fps);
 int camera_uvc_submit_nv12(camera_uvc_backend_t *backend, int camera_id,
                            const void *plane0, size_t plane0_size,
                            const void *plane1, size_t plane1_size,

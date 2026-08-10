@@ -205,10 +205,10 @@
 };
 
 /*-----------------------------------------------------------
- * Fixed USB2 device mode for camera UVC output.
+ * Fixed USB3 device mode for camera UVC output.
  *
  * The FUSB302 role/VBUS detector on this board is unavailable.  Remove its
- * role-switch graph and make DWC3/USB2 PHY independent of that I2C path.
+ * role-switch graph and make DWC3/USB2/USB3 PHY independent of that I2C path.
  * I2C2 itself remains enabled later by the RTC dtsi.
  *-----------------------------------------------------------*/
 &i2c2 {
@@ -220,18 +220,22 @@
 	/delete-property/ svid;
 	/delete-property/ sbu1-dc-gpios;
 	/delete-property/ sbu2-dc-gpios;
-	status = "disabled";
+	status = "okay";
 	/delete-node/ port;
+};
+
+&usbdp_phy_u3 {
+	status = "okay";
 };
 
 &usb_drd0_dwc3 {
 	dr_mode = "peripheral";
-	maximum-speed = "high-speed";
+	maximum-speed = "super-speed";
 	/delete-property/ usb-role-switch;
 	/delete-property/ phys;
 	/delete-property/ phy-names;
-	phys = <&u2phy0_otg>;
-	phy-names = "usb2-phy";
+	phys = <&u2phy0_otg>, <&usbdp_phy_u3>;
+	phy-names = "usb2-phy", "usb3-phy";
 	status = "okay";
 	/delete-node/ port;
 };

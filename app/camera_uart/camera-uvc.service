@@ -1,5 +1,5 @@
 [Unit]
-Description=RK3576 dual-camera UVC output
+Description=RK3576 dual-camera UVC, HTTP and RNDIS companion output
 After=usbdevice.service
 Requires=usbdevice.service
 Conflicts=camera-http.service rkaiq_3A.service
@@ -8,7 +8,7 @@ Conflicts=camera-http.service rkaiq_3A.service
 Type=simple
 WorkingDirectory=/root/camera_uart
 Environment=UVC_CNT=2
-ExecStart=/root/camera_uart/camera_aiq_test --uvc-daemon --uart /dev/ttyS9 --sync-timer-hz 1000000
+ExecStart=/root/camera_uart/camera_aiq_test --all-daemon
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM

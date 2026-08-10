@@ -69,6 +69,9 @@ struct CaptureSlot {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t fps_x1000 = 0;
+    uint32_t fps_measurement_target = 0;
+    uint32_t fps_transition_intervals = 0;
+    bool fps_stable = false;
     uint32_t mapped_count = 0;
     bool have_sequence = false;
     uint32_t last_sequence = 0;
@@ -353,20 +356,51 @@ void capture_worker(CaptureSlot *camera)
             camera->last_buffer_flags = buffer.flags;
             camera->last_v4l2_timestamp_ns = frame_timestamp_ns;
             camera->last_realtime_dequeue_ns = dequeue_realtime_ns;
+            if (camera->fps_measurement_target != 0 &&
+                !camera->recent_timestamps.empty()) {
+                const uint64_t previous_ns =
+                    camera->recent_timestamps.back().timestamp_ns;
+                const uint64_t expected_interval_ns =
+                    1000000000ULL / camera->fps_measurement_target;
+                const uint64_t minimum_interval_ns =
+                    expected_interval_ns * 3ULL / 4ULL;
+                const uint64_t maximum_interval_ns =
+                    expected_interval_ns * 5ULL / 4ULL;
+                const uint64_t interval_ns =
+                    frame_timestamp_ns > previous_ns
+                        ? frame_timestamp_ns - previous_ns
+                        : 0;
+                if (interval_ns < minimum_interval_ns ||
+                    interval_ns > maximum_interval_ns) {
+                    camera->recent_timestamps.clear();
+                    camera->fps_transition_intervals = 0;
+                    camera->fps_stable = false;
+                    camera->fps_x1000 = 0;
+                } else if (camera->fps_transition_intervals < UINT32_MAX) {
+                    ++camera->fps_transition_intervals;
+                    if (camera->fps_transition_intervals >= 3)
+                        camera->fps_stable = true;
+                }
+            }
             camera->recent_timestamps.push_back(
                 {buffer.sequence, buffer.flags, frame_timestamp_ns});
             if (camera->recent_timestamps.size() > kRecentTimestampCount)
                 camera->recent_timestamps.pop_front();
             camera->last_frame_time = now;
-            if (camera->frames_captured > 1) {
-                double elapsed = std::chrono::duration<double>(
-                                     camera->last_frame_time -
-                                     camera->first_frame_time)
-                                     .count();
-                if (elapsed > 0.0) {
+            if (camera->recent_timestamps.size() > 1 &&
+                (camera->fps_measurement_target == 0 ||
+                 camera->fps_stable)) {
+                const uint64_t first_ns =
+                    camera->recent_timestamps.front().timestamp_ns;
+                const uint64_t last_ns =
+                    camera->recent_timestamps.back().timestamp_ns;
+                if (last_ns > first_ns) {
+                    const uint64_t elapsed_ns = last_ns - first_ns;
+                    const uint64_t intervals =
+                        camera->recent_timestamps.size() - 1;
                     camera->fps_x1000 = static_cast<uint32_t>(
-                        ((camera->frames_captured - 1) * 1000.0) / elapsed +
-                        0.5);
+                        (intervals * 1000000000000ULL + elapsed_ns / 2) /
+                        elapsed_ns);
                 }
             }
         }
@@ -490,6 +524,9 @@ void reset_statistics(CaptureSlot &camera)
 {
     camera.last_errno = 0;
     camera.fps_x1000 = 0;
+    camera.fps_measurement_target = 0;
+    camera.fps_transition_intervals = 0;
+    camera.fps_stable = false;
     camera.have_sequence = false;
     camera.last_sequence = 0;
     camera.last_buffer_flags = 0;
@@ -941,6 +978,16 @@ extern "C" int capture_backend_get_status(capture_backend_t *backend,
     status->width = camera.width;
     status->height = camera.height;
     status->fps_x1000 = camera.fps_x1000;
+    status->fps_target_x1000 = camera.fps_measurement_target * 1000U;
+    status->fps_stable = camera.fps_stable ? 1 : 0;
+    status->fps_window_frames =
+        static_cast<uint32_t>(camera.recent_timestamps.size());
+    if (camera.recent_timestamps.size() > 1) {
+        const uint64_t first_ns = camera.recent_timestamps.front().timestamp_ns;
+        const uint64_t last_ns = camera.recent_timestamps.back().timestamp_ns;
+        if (last_ns > first_ns)
+            status->fps_window_duration_ns = last_ns - first_ns;
+    }
     status->frames_captured = camera.frames_captured;
     status->frames_dropped = camera.frames_dropped;
     status->frames_saved = camera.frames_saved;
@@ -963,6 +1010,23 @@ extern "C" int capture_backend_get_status(capture_backend_t *backend,
                   "%s", camera.last_saved_path.c_str());
     std::snprintf(status->metadata_path, sizeof(status->metadata_path), "%s",
                   camera.metadata_path.c_str());
+    return CAPTURE_BACKEND_OK;
+}
+
+extern "C" int capture_backend_reset_fps_window(capture_backend_t *backend,
+                                                   int camera_id,
+                                                   uint32_t target_fps)
+{
+    int result = validate_camera_id(backend, camera_id);
+    if (result != CAPTURE_BACKEND_OK)
+        return result;
+    CaptureSlot &camera = backend->cameras[camera_id];
+    std::lock_guard<std::mutex> lock(camera.state_mutex);
+    camera.recent_timestamps.clear();
+    camera.fps_x1000 = 0;
+    camera.fps_measurement_target = target_fps;
+    camera.fps_transition_intervals = 0;
+    camera.fps_stable = false;
     return CAPTURE_BACKEND_OK;
 }
 

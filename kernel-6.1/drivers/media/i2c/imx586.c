@@ -34,7 +34,7 @@
 #include <linux/rk-preisp.h>
 #include "otp_eeprom.h"
 
-#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x01)
+#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x03)
 
 #ifndef V4L2_CID_DIGITAL_GAIN
 #define V4L2_CID_DIGITAL_GAIN		V4L2_CID_GAIN
@@ -84,7 +84,8 @@
 #define IMX586_REG_EXPOSURE_H		0x0202
 #define IMX586_EXPOSURE_MIN		2
 #define IMX586_EXPOSURE_STEP		1
-#define IMX586_VTS_MAX			0x7fff
+/* Frame length is programmed through the 16-bit 0x0340/0x0341 pair. */
+#define IMX586_VTS_MAX			0xffff
 
 #define IMX586_REG_GAIN_H		0x0204
 #define IMX586_GAIN_MIN			0x10
@@ -133,6 +134,7 @@
 
 #define OF_CAMERA_HDR_MODE		"rockchip,camera-hdr-mode"
 #define OF_CAMERA_XVS_SLAVE_MODE	"sony,xvs-slave-mode"
+#define OF_CAMERA_XVS_INPUT_THIN	"sony,xvs-input-thin"
 
 #define IMX586_NAME			"imx586"
 
@@ -215,6 +217,7 @@ struct imx586 {
 	struct otp_info		*otp;
 	u32			spd_id;
 	bool			xvs_slave_mode;
+	u32			xvs_input_thin;
 };
 
 #define to_imx586(sd) container_of(sd, struct imx586, subdev)
@@ -1041,14 +1044,16 @@ static int imx586_configure_xvs_slave(struct imx586 *imx586)
 				IMX586_REG_INPUT_XVS_MULT_SEL,
 				IMX586_REG_VALUE_08BIT, 0);
 	ret |= imx586_write_reg(imx586->client, IMX586_REG_INPUT_XVS_MULT,
-				IMX586_REG_VALUE_08BIT, 0);
+				IMX586_REG_VALUE_08BIT,
+				imx586->xvs_input_thin);
 	ret |= imx586_write_prsh_length(imx586, exposure);
 	if (ret)
 		return ret;
 
 	dev_info(&imx586->client->dev,
-		 "XVS slave mode enabled: low-active, exposure=%u, prsh=%u lines\n",
-		 exposure, exposure + IMX586_PRSH_MARGIN_LINES);
+		 "XVS slave mode enabled: low-active, input-thin=1/%u, exposure=%u, prsh=%u lines\n",
+		 imx586->xvs_input_thin + 1, exposure,
+		 exposure + IMX586_PRSH_MARGIN_LINES);
 
 	return 0;
 }
@@ -1258,9 +1263,17 @@ static int imx586_g_frame_interval(struct v4l2_subdev *sd,
 				   struct v4l2_subdev_frame_interval *fi)
 {
 	struct imx586 *imx586 = to_imx586(sd);
-	const struct imx586_mode *mode = imx586->cur_mode;
+	const struct imx586_mode *mode;
+	u32 numerator;
+	u32 denominator;
 
-	fi->interval = mode->max_fps;
+	mutex_lock(&imx586->mutex);
+	mode = imx586->cur_mode;
+	numerator = mode->max_fps.numerator * imx586->cur_vts;
+	denominator = mode->max_fps.denominator * mode->vts_def;
+	fi->interval.numerator = numerator;
+	fi->interval.denominator = denominator;
+	mutex_unlock(&imx586->mutex);
 
 	return 0;
 }
@@ -1473,6 +1486,24 @@ static long imx586_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		ch_info = (struct rkmodule_channel_info *)arg;
 		ret = imx586_get_channel_info(imx586, ch_info);
 		break;
+	case RKMODULE_SET_XVS_INPUT_THIN:
+		stream = *((u32 *)arg);
+		if (!imx586->xvs_slave_mode || stream > 1) {
+			ret = -EINVAL;
+			break;
+		}
+		mutex_lock(&imx586->mutex);
+		if (imx586->streaming)
+			ret = -EBUSY;
+		else
+			imx586->xvs_input_thin = stream;
+		mutex_unlock(&imx586->mutex);
+		break;
+	case RKMODULE_GET_XVS_INPUT_THIN:
+		mutex_lock(&imx586->mutex);
+		*((u32 *)arg) = imx586->xvs_input_thin;
+		mutex_unlock(&imx586->mutex);
+		break;
 	default:
 		ret = -ENOIOCTLCMD;
 		break;
@@ -1566,11 +1597,20 @@ static long imx586_compat_ioctl32(struct v4l2_subdev *sd,
 		kfree(hdrae);
 		break;
 	case RKMODULE_SET_QUICK_STREAM:
+	case RKMODULE_SET_XVS_INPUT_THIN:
 		ret = copy_from_user(&stream, up, sizeof(u32));
 		if (!ret)
 			ret = imx586_ioctl(sd, cmd, &stream);
 		else
 			ret = -EFAULT;
+		break;
+	case RKMODULE_GET_XVS_INPUT_THIN:
+		ret = imx586_ioctl(sd, cmd, &stream);
+		if (!ret) {
+			ret = copy_to_user(up, &stream, sizeof(u32));
+			if (ret)
+				ret = -EFAULT;
+		}
 		break;
 	case RKMODULE_GET_CHANNEL_INFO:
 		ch_info = kzalloc(sizeof(*ch_info), GFP_KERNEL);
@@ -2162,6 +2202,18 @@ static int imx586_probe(struct i2c_client *client,
 
 	imx586->xvs_slave_mode =
 		of_property_read_bool(node, OF_CAMERA_XVS_SLAVE_MODE);
+	imx586->xvs_input_thin = 0;
+	if (imx586->xvs_slave_mode) {
+		ret = of_property_read_u32(node, OF_CAMERA_XVS_INPUT_THIN,
+					   &imx586->xvs_input_thin);
+		if (ret && ret != -EINVAL)
+			return ret;
+		if (imx586->xvs_input_thin > 1) {
+			dev_err(dev, "%s must be 0 (1:1) or 1 (1:2)\n",
+				OF_CAMERA_XVS_INPUT_THIN);
+			return -EINVAL;
+		}
+	}
 
 	ret = of_property_read_u32(node, OF_CAMERA_HDR_MODE, &hdr_mode);
 	if (ret) {

@@ -1,11 +1,13 @@
 #include "camera_backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <mutex>
@@ -26,8 +28,18 @@ constexpr uint32_t kMinExposureUs = 1;
 constexpr uint32_t kMaxExposureUs = 1000000;
 constexpr uint32_t kMinGainX1000 = 1000;
 constexpr uint32_t kMaxGainX1000 = 64000;
+constexpr uint32_t kBaseIso = 50;
+constexpr uint32_t kMinIso = kBaseIso;
+constexpr uint32_t kMaxIso = kMaxGainX1000 * kBaseIso / 1000;
 constexpr uint32_t kMinFps = 1;
 constexpr uint32_t kMaxFps = 120;
+constexpr uint32_t kXvsMasterFps = 4;
+constexpr unsigned long kSetXvsInputThin =
+    _IOW('V', BASE_VIDIOC_PRIVATE + 47, uint32_t);
+constexpr unsigned long kGetXvsInputThin =
+    _IOR('V', BASE_VIDIOC_PRIVATE + 48, uint32_t);
+constexpr int kManualVerifyAttempts = 40;
+constexpr auto kManualVerifyInterval = std::chrono::milliseconds(100);
 constexpr uint32_t kStreamStartEvent = V4L2_EVENT_PRIVATE_START + 1;
 constexpr uint32_t kStreamStopEvent = V4L2_EVENT_PRIVATE_START + 2;
 
@@ -36,11 +48,17 @@ struct CameraSlot {
     rk_aiq_sys_ctx_t *ctx = nullptr;
     bool started = false;
     bool manual_mode = false;
+    bool manual_target_valid = false;
+    bool manual_settings_verified = false;
+    uint32_t requested_exposure_us = 0;
+    uint32_t requested_gain_x1000 = 0;
+    uint32_t requested_iso = 0;
     uint32_t requested_fps = 0;
     int last_aiq_error = 0;
     std::string sensor_name;
     std::string iq_dir;
     std::string params_device;
+    std::string sensor_device;
     int event_fd = -1;
     std::atomic<bool> stop_event_thread{false};
     std::thread event_thread;
@@ -50,6 +68,56 @@ bool directory_exists(const char *path)
 {
     struct stat st = {};
     return path != nullptr && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+std::string discover_sensor_device(const std::string &sensor_name)
+{
+    DIR *directory = opendir("/sys/class/video4linux");
+    if (!directory)
+        return {};
+
+    std::string result;
+    while (dirent *entry = readdir(directory)) {
+        if (std::strncmp(entry->d_name, "v4l-subdev", 10) != 0)
+            continue;
+        const std::string sysfs_name =
+            std::string("/sys/class/video4linux/") + entry->d_name + "/name";
+        FILE *file = std::fopen(sysfs_name.c_str(), "r");
+        if (!file)
+            continue;
+        char line[256] = {};
+        const bool read_ok = std::fgets(line, sizeof(line), file) != nullptr;
+        std::fclose(file);
+        if (!read_ok)
+            continue;
+        line[std::strcspn(line, "\r\n")] = '\0';
+        if (sensor_name != line)
+            continue;
+        result = std::string("/dev/") + entry->d_name;
+        break;
+    }
+    closedir(directory);
+    return result;
+}
+
+int sensor_xvs_thin_ioctl(CameraSlot &camera, unsigned long request,
+                          uint32_t *thin)
+{
+    if (!thin || camera.sensor_device.empty())
+        return CAMERA_BACKEND_ERR_IO;
+    const int fd = open(camera.sensor_device.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return CAMERA_BACKEND_ERR_IO;
+    int ioctl_result;
+    do {
+        ioctl_result = ioctl(fd, request, thin);
+    } while (ioctl_result < 0 && errno == EINTR);
+    const int saved_errno = errno;
+    close(fd);
+    if (ioctl_result == 0)
+        return CAMERA_BACKEND_OK;
+    return saved_errno == EBUSY ? CAMERA_BACKEND_ERR_NOT_READY
+                                : CAMERA_BACKEND_ERR_IO;
 }
 
 int validate_camera_id(const camera_backend_t *backend, int camera_id)
@@ -81,6 +149,131 @@ int record_aiq_result(CameraSlot &camera, const char *operation,
                  camera.sensor_name.c_str(), operation,
                  static_cast<int>(aiq_result));
     return CAMERA_BACKEND_ERR_AIQ;
+}
+
+int set_linear_manual_exposure(CameraSlot &camera, float exposure_seconds,
+                               float analog_gain, const char *get_operation,
+                               const char *set_operation)
+{
+    ae_api_expSwAttr_t attribute = {};
+    int result = record_aiq_result(
+        camera, get_operation,
+        rk_aiq_user_api2_ae_getExpSwAttr(camera.ctx, &attribute));
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+
+    attribute.commCtrl.sw_aeT_opt_mode = RK_AIQ_OP_MODE_MANUAL;
+    attribute.commCtrl.meCtrl.linMe.sw_aeT_manTime_en = true;
+    attribute.commCtrl.meCtrl.linMe.sw_aeT_manGain_en = true;
+    attribute.commCtrl.meCtrl.linMe.sw_aeT_manTime_val = exposure_seconds;
+    attribute.commCtrl.meCtrl.linMe.sw_aeT_manGain_val = analog_gain;
+
+    return record_aiq_result(
+        camera, set_operation,
+        rk_aiq_user_api2_ae_setExpSwAttr(camera.ctx, attribute));
+}
+
+bool within_tolerance(uint32_t actual, uint32_t requested,
+                      uint32_t minimum_tolerance)
+{
+    const uint32_t tolerance =
+        std::max(minimum_tolerance, requested / 50U);
+    const uint32_t difference = actual >= requested ? actual - requested
+                                                    : requested - actual;
+    return difference <= tolerance;
+}
+
+bool valid_linear_query(const ae_api_queryInfo_t &query)
+{
+    const float exposure = query.linExpInfo.expParam.integration_time;
+    const float gain = query.linExpInfo.expParam.analog_gain;
+    return std::isfinite(exposure) && exposure > 0.0f &&
+           std::isfinite(gain) && gain >= 1.0f;
+}
+
+int initialize_manual_target(CameraSlot &camera, const char *operation)
+{
+    if (camera.manual_target_valid)
+        return CAMERA_BACKEND_OK;
+
+    ae_api_queryInfo_t current = {};
+    int result = record_aiq_result(
+        camera, operation,
+        rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &current));
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+    if (!valid_linear_query(current)) {
+        std::fprintf(stderr,
+                     "CAMERA_AIQ_ERROR sensor=%s operation=%s invalid_time=%f invalid_gain=%f\n",
+                     camera.sensor_name.c_str(), operation,
+                     current.linExpInfo.expParam.integration_time,
+                     current.linExpInfo.expParam.analog_gain);
+        return CAMERA_BACKEND_ERR_NOT_READY;
+    }
+
+    camera.requested_exposure_us = to_u32_rounded(
+        current.linExpInfo.expParam.integration_time * 1000000.0f);
+    camera.requested_gain_x1000 = to_u32_rounded(
+        current.linExpInfo.expParam.analog_gain * 1000.0f);
+    camera.requested_iso = to_u32_rounded(
+        current.linExpInfo.expParam.analog_gain * kBaseIso);
+    camera.manual_target_valid = true;
+    camera.manual_settings_verified = false;
+    return CAMERA_BACKEND_OK;
+}
+
+int apply_manual_target(CameraSlot &camera, const char *operation)
+{
+    const float exposure_seconds =
+        static_cast<float>(camera.requested_exposure_us) / 1000000.0f;
+    const float gain =
+        static_cast<float>(camera.requested_gain_x1000) / 1000.0f;
+    int result = set_linear_manual_exposure(
+        camera, exposure_seconds, gain, "getExpSwAttr(manual-target)",
+        operation);
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+
+    camera.manual_mode = true;
+    camera.manual_settings_verified = false;
+    for (int attempt = 0; attempt < kManualVerifyAttempts; ++attempt) {
+        ae_api_queryInfo_t query = {};
+        XCamReturn query_result =
+            rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &query);
+        if (query_result == XCAM_RETURN_NO_ERROR && valid_linear_query(query)) {
+            const uint32_t exposure_us = to_u32_rounded(
+                query.linExpInfo.expParam.integration_time * 1000000.0f);
+            const uint32_t gain_x1000 = to_u32_rounded(
+                query.linExpInfo.expParam.analog_gain * 1000.0f);
+            if (within_tolerance(exposure_us, camera.requested_exposure_us,
+                                 100U) &&
+                within_tolerance(gain_x1000, camera.requested_gain_x1000,
+                                 50U)) {
+                camera.manual_settings_verified = true;
+                camera.last_aiq_error = 0;
+                return CAMERA_BACKEND_OK;
+            }
+        } else if (query_result != XCAM_RETURN_NO_ERROR) {
+            camera.last_aiq_error = static_cast<int>(query_result);
+        }
+        std::this_thread::sleep_for(kManualVerifyInterval);
+    }
+
+    std::fprintf(stderr,
+                 "CAMERA_VERIFY_ERROR sensor=%s requested_exposure_us=%u requested_gain_x1000=%u\n",
+                 camera.sensor_name.c_str(), camera.requested_exposure_us,
+                 camera.requested_gain_x1000);
+    return CAMERA_BACKEND_ERR_VERIFY;
+}
+
+void reset_manual_target(CameraSlot &camera)
+{
+    camera.manual_mode = false;
+    camera.manual_target_valid = false;
+    camera.manual_settings_verified = false;
+    camera.requested_exposure_us = 0;
+    camera.requested_gain_x1000 = 0;
+    camera.requested_iso = 0;
 }
 
 int set_stream_event_subscription(int fd, uint32_t event_type, bool subscribe)
@@ -137,8 +330,7 @@ void stream_event_worker(CameraSlot *camera)
             if (record_aiq_result(*camera, "stop", aiq_result) ==
                 CAMERA_BACKEND_OK) {
                 camera->started = false;
-                camera->manual_mode = false;
-                camera->requested_fps = 0;
+                reset_manual_target(*camera);
                 std::fprintf(stdout,
                              "CAMERA_STREAM sensor=%s state=STOPPED params=%s\n",
                              camera->sensor_name.c_str(),
@@ -264,6 +456,28 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
                          camera_id, expected, camera.sensor_name.c_str());
             result = CAMERA_BACKEND_ERR_SENSOR_MISMATCH;
             break;
+        }
+
+        const char *sensor_device = config->sensor_device[camera_id];
+        camera.sensor_device =
+            sensor_device && sensor_device[0] != '\0'
+                ? sensor_device
+                : discover_sensor_device(camera.sensor_name);
+        if (camera.sensor_device.empty()) {
+            std::fprintf(stderr,
+                         "CAMERA_XVS_WARNING camera_id=%d sensor=%s reason=\"sensor subdevice not found; fps 2/4 switching unavailable\"\n",
+                         camera_id, camera.sensor_name.c_str());
+        } else {
+            uint32_t thin = 0;
+            if (sensor_xvs_thin_ioctl(camera, kGetXvsInputThin, &thin) ==
+                CAMERA_BACKEND_OK) {
+                camera.requested_fps = kXvsMasterFps / (thin + 1U);
+            } else {
+                std::fprintf(stderr,
+                             "CAMERA_XVS_WARNING camera_id=%d sensor=%s subdev=%s reason=\"driver XVS thinning ioctl unavailable\"\n",
+                             camera_id, camera.sensor_name.c_str(),
+                             camera.sensor_device.c_str());
+            }
         }
 
         camera.ctx = rk_aiq_uapi2_sysctl_init(camera.sensor_name.c_str(),
@@ -392,7 +606,7 @@ extern "C" int camera_backend_set_auto(camera_backend_t *backend,
     result = record_aiq_result(camera, "setExpMode(auto)",
                                rk_aiq_uapi2_setExpMode(camera.ctx, OP_AUTO));
     if (result == CAMERA_BACKEND_OK)
-        camera.manual_mode = false;
+        reset_manual_target(camera);
     return result;
 }
 extern "C" int camera_backend_set_exposure(camera_backend_t *backend,
@@ -410,58 +624,11 @@ extern "C" int camera_backend_set_exposure(camera_backend_t *backend,
     if (camera.ctx == nullptr || !camera.started)
         return CAMERA_BACKEND_ERR_NOT_READY;
 
-    ae_api_queryInfo_t current = {};
-    XCamReturn query_result =
-        rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &current);
-    result = record_aiq_result(camera, "queryBeforeSetExposure", query_result);
+    result = initialize_manual_target(camera, "queryBeforeSetExposure");
     if (result != CAMERA_BACKEND_OK)
         return result;
-
-    const float current_time =
-        current.linExpInfo.expParam.integration_time;
-    const float current_gain = current.linExpInfo.expParam.analog_gain;
-    if (!std::isfinite(current_time) || current_time <= 0.0f ||
-        !std::isfinite(current_gain) || current_gain < 1.0f) {
-        std::fprintf(stderr,
-                     "CAMERA_AIQ_ERROR sensor=%s operation=queryBeforeSetExposure invalid_time=%f invalid_gain=%f\n",
-                     camera.sensor_name.c_str(), current_time, current_gain);
-        return CAMERA_BACKEND_ERR_NOT_READY;
-    }
-
-    result = record_aiq_result(
-        camera, "setExpMode(exposure)",
-        rk_aiq_uapi2_setExpMode(camera.ctx, OP_MANUAL));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-    result = record_aiq_result(
-        camera, "setExpTimeMode(exposure)",
-        rk_aiq_uapi2_setExpTimeMode(camera.ctx, OP_MANUAL));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-    result = record_aiq_result(
-        camera, "setExpGainMode(exposure)",
-        rk_aiq_uapi2_setExpGainMode(camera.ctx, OP_MANUAL));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-
-    result = record_aiq_result(
-        camera, "seedExposureTime",
-        rk_aiq_uapi2_setExpManualTime(camera.ctx, current_time));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-    result = record_aiq_result(
-        camera, "holdExposureGain",
-        rk_aiq_uapi2_setExpManualGain(camera.ctx, current_gain));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-
-    const float exposure_seconds = static_cast<float>(exposure_us) / 1000000.0f;
-    result = record_aiq_result(
-        camera, "setExposureOnly",
-        rk_aiq_uapi2_setExpManualTime(camera.ctx, exposure_seconds));
-    if (result == CAMERA_BACKEND_OK)
-        camera.manual_mode = true;
-    return result;
+    camera.requested_exposure_us = exposure_us;
+    return apply_manual_target(camera, "setExpSwAttr(exposure)");
 }
 
 extern "C" int camera_backend_set_gain(camera_backend_t *backend,
@@ -479,58 +646,36 @@ extern "C" int camera_backend_set_gain(camera_backend_t *backend,
     if (camera.ctx == nullptr || !camera.started)
         return CAMERA_BACKEND_ERR_NOT_READY;
 
-    ae_api_queryInfo_t current = {};
-    XCamReturn query_result =
-        rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &current);
-    result = record_aiq_result(camera, "queryBeforeSetGain", query_result);
+    result = initialize_manual_target(camera, "queryBeforeSetGain");
     if (result != CAMERA_BACKEND_OK)
         return result;
+    camera.requested_gain_x1000 = gain_x1000;
+    camera.requested_iso =
+        (gain_x1000 * kBaseIso + 500U) / 1000U;
+    return apply_manual_target(camera, "setExpSwAttr(gain)");
+}
 
-    const float current_time =
-        current.linExpInfo.expParam.integration_time;
-    const float current_gain = current.linExpInfo.expParam.analog_gain;
-    if (!std::isfinite(current_time) || current_time <= 0.0f ||
-        !std::isfinite(current_gain) || current_gain < 1.0f) {
-        std::fprintf(stderr,
-                     "CAMERA_AIQ_ERROR sensor=%s operation=queryBeforeSetGain invalid_time=%f invalid_gain=%f\n",
-                     camera.sensor_name.c_str(), current_time, current_gain);
+extern "C" int camera_backend_set_iso(camera_backend_t *backend,
+                                        int camera_id, uint32_t iso)
+{
+    int result = validate_camera_id(backend, camera_id);
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+    if (iso < kMinIso || iso > kMaxIso)
+        return CAMERA_BACKEND_ERR_RANGE;
+
+    CameraSlot &camera = backend->cameras[camera_id];
+    std::lock_guard<std::mutex> lock(camera.mutex);
+    if (camera.ctx == nullptr || !camera.started)
         return CAMERA_BACKEND_ERR_NOT_READY;
-    }
 
-    result = record_aiq_result(
-        camera, "setExpMode(gain)",
-        rk_aiq_uapi2_setExpMode(camera.ctx, OP_MANUAL));
+    result = initialize_manual_target(camera, "queryBeforeSetIso");
     if (result != CAMERA_BACKEND_OK)
         return result;
-    result = record_aiq_result(
-        camera, "setExpTimeMode(gain)",
-        rk_aiq_uapi2_setExpTimeMode(camera.ctx, OP_MANUAL));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-    result = record_aiq_result(
-        camera, "setExpGainMode(gain)",
-        rk_aiq_uapi2_setExpGainMode(camera.ctx, OP_MANUAL));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-
-    result = record_aiq_result(
-        camera, "holdGainTime",
-        rk_aiq_uapi2_setExpManualTime(camera.ctx, current_time));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-    result = record_aiq_result(
-        camera, "seedGain",
-        rk_aiq_uapi2_setExpManualGain(camera.ctx, current_gain));
-    if (result != CAMERA_BACKEND_OK)
-        return result;
-
-    const float gain = static_cast<float>(gain_x1000) / 1000.0f;
-    result = record_aiq_result(
-        camera, "setAnalogGainOnly",
-        rk_aiq_uapi2_setExpManualGain(camera.ctx, gain));
-    if (result == CAMERA_BACKEND_OK)
-        camera.manual_mode = true;
-    return result;
+    camera.requested_gain_x1000 =
+        (iso * 1000U + kBaseIso / 2U) / kBaseIso;
+    camera.requested_iso = iso;
+    return apply_manual_target(camera, "setExpSwAttr(iso)");
 }
 
 extern "C" int camera_backend_set_fps(camera_backend_t *backend, int camera_id,
@@ -558,6 +703,45 @@ extern "C" int camera_backend_set_fps(camera_backend_t *backend, int camera_id,
     return result;
 }
 
+extern "C" int camera_backend_set_xvs_fps(camera_backend_t *backend,
+                                            int camera_id, uint32_t fps)
+{
+    int result = validate_camera_id(backend, camera_id);
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+    if (fps != 2 && fps != 4)
+        return CAMERA_BACKEND_ERR_RANGE;
+
+    CameraSlot &camera = backend->cameras[camera_id];
+    std::lock_guard<std::mutex> lock(camera.mutex);
+    uint32_t thin = fps == 2 ? 1U : 0U;
+    result = sensor_xvs_thin_ioctl(camera, kSetXvsInputThin, &thin);
+    if (result == CAMERA_BACKEND_OK)
+        camera.requested_fps = fps;
+    return result;
+}
+
+extern "C" int camera_backend_get_xvs_fps(camera_backend_t *backend,
+                                            int camera_id, uint32_t *fps)
+{
+    if (!fps)
+        return CAMERA_BACKEND_ERR_ARGUMENT;
+    int result = validate_camera_id(backend, camera_id);
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+
+    CameraSlot &camera = backend->cameras[camera_id];
+    std::lock_guard<std::mutex> lock(camera.mutex);
+    uint32_t thin = 0;
+    result = sensor_xvs_thin_ioctl(camera, kGetXvsInputThin, &thin);
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+    if (thin > 1)
+        return CAMERA_BACKEND_ERR_VERIFY;
+    *fps = kXvsMasterFps / (thin + 1U);
+    return CAMERA_BACKEND_OK;
+}
+
 extern "C" int camera_backend_get_status(camera_backend_t *backend,
                                          int camera_id,
                                          camera_backend_status_t *status)
@@ -576,11 +760,24 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
     status->online = camera.ctx != nullptr;
     status->started = camera.started;
     status->manual_mode = camera.manual_mode;
+    status->manual_settings_verified = camera.manual_settings_verified;
+    status->requested_exposure_us = camera.requested_exposure_us;
+    status->requested_gain_x1000 = camera.requested_gain_x1000;
+    status->requested_iso = camera.requested_iso;
+    status->requested_fps_x1000 = camera.requested_fps * 1000U;
     status->last_aiq_error = camera.last_aiq_error;
     std::snprintf(status->sensor_name, sizeof(status->sensor_name), "%s",
                   camera.sensor_name.c_str());
     std::snprintf(status->iq_dir, sizeof(status->iq_dir), "%s",
                   camera.iq_dir.c_str());
+    std::snprintf(status->sensor_device, sizeof(status->sensor_device), "%s",
+                  camera.sensor_device.c_str());
+    uint32_t xvs_thin = 0;
+    if (sensor_xvs_thin_ioctl(camera, kGetXvsInputThin, &xvs_thin) ==
+        CAMERA_BACKEND_OK) {
+        status->xvs_config_valid = 1;
+        status->xvs_input_thin = xvs_thin;
+    }
 
     if (camera.ctx == nullptr || !camera.started)
         return CAMERA_BACKEND_ERR_NOT_READY;
@@ -600,9 +797,40 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
             query.linExpInfo.expParam.integration_time * 1000000.0f);
         status->gain_x1000 = to_u32_rounded(
             query.linExpInfo.expParam.analog_gain * 1000.0f);
-        status->iso = query.linExpInfo.expParam.iso;
-        status->fps_x1000 = to_u32_rounded(query.fps * 1000.0f);
+        status->digital_gain_x1000 = to_u32_rounded(
+            query.linExpInfo.expParam.digital_gain * 1000.0f);
+        status->isp_dgain_x1000 = to_u32_rounded(
+            query.linExpInfo.expParam.isp_dgain * 1000.0f);
+        status->aiq_iso = query.linExpInfo.expParam.iso;
+        if (status->aiq_iso > 0) {
+            status->iso = status->aiq_iso;
+        } else {
+            const float digital_gain =
+                query.linExpInfo.expParam.digital_gain > 0.0f
+                    ? query.linExpInfo.expParam.digital_gain
+                    : 1.0f;
+            const float isp_dgain =
+                query.linExpInfo.expParam.isp_dgain > 0.0f
+                    ? query.linExpInfo.expParam.isp_dgain
+                    : 1.0f;
+            status->iso = static_cast<int>(to_u32_rounded(
+                query.linExpInfo.expParam.analog_gain * digital_gain *
+                isp_dgain * kBaseIso));
+            status->iso_estimated = 1;
+        }
+        status->fps_x1000 = camera.requested_fps
+                                ? camera.requested_fps * 1000U
+                                : to_u32_rounded(query.fps * 1000.0f);
         status->mean_luma = query.linExpInfo.meanLuma;
+        if (camera.manual_target_valid) {
+            status->manual_settings_verified =
+                within_tolerance(status->exposure_us,
+                                 camera.requested_exposure_us, 100U) &&
+                within_tolerance(status->gain_x1000,
+                                 camera.requested_gain_x1000, 50U);
+            camera.manual_settings_verified =
+                status->manual_settings_verified != 0;
+        }
     } else if (camera.requested_fps != 0) {
         status->fps_x1000 = camera.requested_fps * 1000;
     }
@@ -634,6 +862,8 @@ extern "C" const char *camera_backend_strerror(int result)
         return "camera is not ready";
     case CAMERA_BACKEND_ERR_SENSOR_MISMATCH:
         return "camera sensor does not match configuration";
+    case CAMERA_BACKEND_ERR_VERIFY:
+        return "manual setting did not reach requested value";
     default:
         return "unknown camera backend error";
     }

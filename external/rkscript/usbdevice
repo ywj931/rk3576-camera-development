@@ -327,7 +327,7 @@ uvc_add_mjpeg()
 	echo $WIDTH > $DIR/wWidth
 	echo $HEIGHT > $DIR/wHeight
 	if [ "$WIDTH" = 4000 ] && [ "$HEIGHT" = 3000 ]; then
-		echo 1000000 > $DIR/dwDefaultFrameInterval
+		echo 2500000 > $DIR/dwDefaultFrameInterval
 	else
 		echo 333333 > $DIR/dwDefaultFrameInterval
 	fi
@@ -335,7 +335,7 @@ uvc_add_mjpeg()
 	echo $((WIDTH * HEIGHT * 20)) > $DIR/dwMaxBitRate
 	echo $((WIDTH * HEIGHT * 2)) > $DIR/dwMaxVideoFrameBufferSize
 	if [ "$WIDTH" = 4000 ] && [ "$HEIGHT" = 3000 ]; then
-		printf '1000000\n2000000\n' > $DIR/dwFrameInterval
+		printf '2500000\n5000000\n' > $DIR/dwFrameInterval
 	else
 		printf '333333\n666666\n1000000\n2000000\n' > $DIR/dwFrameInterval
 	fi
@@ -542,7 +542,7 @@ usb_funcs_grep()
 usb_funcs_sort()
 {
 	# Orders required by kernel
-	FUNCS="rndis uac uvc ntb ums mtp acm"
+	FUNCS=${USB_FUNC_ORDER:-"rndis uac uvc ntb ums mtp acm"}
 	{
 		for func in $FUNCS; do
 			usb_funcs_grep $func

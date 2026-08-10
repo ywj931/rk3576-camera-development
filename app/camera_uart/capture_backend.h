@@ -49,6 +49,10 @@ typedef struct capture_backend_status {
     uint32_t width;
     uint32_t height;
     uint32_t fps_x1000;
+    uint32_t fps_target_x1000;
+    int fps_stable;
+    uint32_t fps_window_frames;
+    uint64_t fps_window_duration_ns;
     uint64_t frames_captured;
     uint64_t frames_dropped;
     uint64_t frames_saved;
@@ -97,6 +101,9 @@ int capture_backend_start_save(capture_backend_t *backend, int camera_id,
 int capture_backend_stop_save(capture_backend_t *backend, int camera_id);
 int capture_backend_get_status(capture_backend_t *backend, int camera_id,
                                capture_backend_status_t *status);
+/* Starts a fresh sliding FPS measurement after changing sensor frame rate. */
+int capture_backend_reset_fps_window(capture_backend_t *backend,
+                                     int camera_id, uint32_t target_fps);
 int capture_backend_get_sync_status(capture_backend_t *backend,
                                     capture_backend_sync_status_t *status);
 

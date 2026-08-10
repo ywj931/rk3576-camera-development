@@ -54,7 +54,7 @@
 		rockchip,camera-module-name = "default";
 		rockchip,camera-module-lens-name = "default";
 		rockchip,camera-hdr-mode = <0>;
-		/* Shared 1.8 V, low-active XVS input from FSYNC_CAM. */
+		/* Free-running until the external MCU XVS source is installed. */
 
 		port {
 			imx586_1_out: endpoint {
