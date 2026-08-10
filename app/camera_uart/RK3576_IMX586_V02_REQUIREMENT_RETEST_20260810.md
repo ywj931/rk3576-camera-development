@@ -4,7 +4,7 @@
 需求依据：`RK3576 MIPI 相机模组任务计划 v0.2`  
 被测硬件：RK3576、两颗 IMX586、STM32F103 XVS 发生器  
 被测程序：`/root/camera_uart/camera_aiq_test`  
-程序 SHA256：`c6cdd3064a1509ad2175590d2e2e68fe3016758fac0d656f296d0bb26c282a58`  
+程序 SHA256：`c514571b29cb68b31486ee85eb0732067793c6360a9755276e869d7bd0c1a7a3`
 本轮证据目录：`test_results/20260810_v02_requirement_retest`  
 板端证据目录：`/root/camera_uart/test_results/20260810_v02_requirement_retest`
 
@@ -13,24 +13,24 @@
 | 阶段 | 本轮判定 | 最关键的实测结果 |
 | --- | --- | --- |
 | 1. 双路出图和映射 | 通过 | 双路 4000x3000 约 2 Hz，短时连续采集无 sequence 丢帧，单停 cam1 不影响 cam0 |
-| 2. 独立 ISP/IQ 和参数 | 部分通过 | 曝光、增益、ISO 的独立设置和最终回读通过；低帧率时命令会先误报校验超时；两份 IQ 内容相同，AWB/BLC/LSC/LDC 独立调校未验收 |
+| 2. 独立 ISP/IQ 和参数 | 部分通过 | 曝光、增益、ISO 的独立设置和最终回读通过；低帧率校验已改为 `pending` 后异步 `verified`，不再误报失败；两份 IQ 内容相同，AWB/BLC/LSC/LDC 独立调校未验收 |
 | 3. 2-4 Hz、稳定性、资源和功耗 | 部分通过，目标未全部达到 | STM32 物理输入约 2 Hz；`1/1` 时两路真实约 2 Hz，`1/2` 时约 1 Hz；真实 4 Hz和四组合不通过；功耗和长稳未测 |
-| 4. 驱动和 UART 控制 | 部分通过 | 控制程序和协议自测通过，RK3576 发出 38 字节；STM32 回传为 0 字节，真实双向 UART 不通过 |
+| 4. 驱动和 UART 控制 | 部分通过 | 控制程序、CRC 和伪终端协议自测通过；本轮 MCU UART 未接线，真实 TX/RX、电平和 STM32 应答未执行 |
 | 5. PPS/NMEA/Trigger 硬件同步 | 部分通过 | 两路 XVS 从模式约 2 Hz 通过，软件模拟绑定通过；真实 PPS、UTC、Trigger 事件和曝光起点精度未验收 |
 | 6. EXIF 和照片元数据 | 部分通过 | 双路实际 JPEG 的 EXIF、UserComment、frame_id、trigger_id 均存在；当前是模拟触发且 UTC 无效 |
-| 7. UVC/网口/eMMC | 部分通过 | 双 UVC、双 HTTP、RNDIS ping/SSH和eMMC均实测通过且可共存；实际链路为 USB2.0 480M，不是 USB3.0；UVC启动瞬态有跳号 |
+| 7. UVC/网口/eMMC | 部分通过 | 双 UVC、双 HTTP、RNDIS ping/SSH和eMMC均实测通过且可共存；UVC启动坏帧、空帧、跳号和双帧突发已修复；实际链路仍为 USB2.0 480M，不是 USB3.0 |
 
 因此不能写成“只有 MCU 没测，其余全部通过”。目前还剩五类正式验收缺口：
 
-1. STM32 UART 双向通信以及 MCU 切换到共享 4 Hz。
+1. 接好 STM32 UART 后执行真实双向通信，以及 MCU 切换到共享 4 Hz。
 2. 四种帧率组合 `4/4`、`4/2`、`2/4`、`2/2` 的真实物理帧率。
 3. 真实 PPS、GPRMC/GNRMC、XVS trigger_id 和 UTC 锁定。
 4. 两颗传感器曝光起点同步精度的外部测量。
-5. USB3.0物理链路、UVC启动瞬态，以及长稳和功耗测试。
+5. USB3.0物理链路，以及长稳和功耗测试。
 
 ## 2. 本轮测试边界
 
-当前 STM32 的 XVS 线已经接入，两颗 IMX586 都运行在 XVS Slave 模式。实测 XVS 是固定约 2 Hz。STM32 UART 没有任何返回，所以无法查询其固件版本、当前频率，也无法命令它切换到 4 Hz。
+当前 STM32 的 XVS 线已经接入，两颗 IMX586 都运行在 XVS Slave 模式。实测 XVS 是固定约 2 Hz。本轮没有连接 MCU UART，因此没有执行真实双向 UART，也无法通过协议查询固件版本、当前频率或命令 MCU 切换到 4 Hz。此前记录的 `ttyS9 tx:38 rx:0` 只能说明板端发送函数被调用，不能据此判断 STM32 没有应答或 UART 链路失败。
 
 本轮没有接入或没有得到有效数据的部分：
 
@@ -134,7 +134,9 @@ status all
 
 所有上述状态均为 `manual_settings_verified=1`。
 
-本轮USB补测期间，传感器一度处于约1 fps。此时`exposure`、`gain`和`iso`命令会先返回`code=-7 manual setting did not reach requested value`，但等待约3秒后实际回读值全部正确并显示`manual_settings_verified=1`。这说明硬件设置最终生效，但程序的即时校验窗口短于低帧率下的新帧到达时间。产品程序应按当前实测帧周期动态延长校验超时，或将命令返回改成“已提交”，再异步报告最终状态。
+低帧率下参数设置的返回语义已经修复。RKAIQ 接受设置后，程序立即查询；如果承载新参数的帧尚未到达，命令返回 `OK ... verification=pending`，状态中显示 `manual_settings_pending=1`，不再返回 `code=-7`。新帧到达并且回读匹配后，状态自动变为 `manual_settings_verified=1 manual_settings_pending=0`。
+
+板端在两路实际约 2.000 fps 时复测：cam0 最终回读 `5004 us、3x、ISO 150`，cam1 最终回读 `19996 us、6x、ISO 300`，两路 sequence 无跳号且均为 `verified`。连续设置后等待 2 秒有时仍处于 `pending`，再等待约 3.5 秒两路均完成验证。命令成功表示 RKAIQ 已接受请求，`pending` 表示等待新帧，只有 `verified` 才表示对应帧的实际回读已经匹配。
 
 ### 5.3 `actual_iso` 和 `estimated_iso` 的解释
 
@@ -241,16 +243,9 @@ XVS_PROTOCOL_SELF_TEST_OK
 
 ### 7.2 真实 UART 线
 
-`/dev/ttyS9` 已配置为 115200、8N1、raw、无流控。发送：
+本轮 MCU UART 未接线，真实双向 UART 没有执行。`/dev/ttyS9` 的 115200、8N1、raw、无流控配置和板端 TX 调用只能作为软件准备状态，不能证明 TX 波形已到达 STM32，也不能证明 RX、STM32 应答和电气链路正常。
 
-```text
-$XVS,1,PING*2D89\r\n
-$XVS,1,STATUS*CEDA\r\n
-```
-
-计数从 `tx:0 rx:0` 变为 `tx:38 rx:0`，被动监听和主动等待都收到 0 字节。
-
-这证明 RK3576 的发送路径工作，但不能证明板端 UART 双向通信。优先逐项检查：
+后续接线后按以下顺序验收：
 
 1. CN4 pin19 `UART_CAM1_TX` 是否接 STM32 RX。
 2. CN4 pin17 `UART_CAM1_RX` 是否接 STM32 TX。
@@ -259,8 +254,9 @@ $XVS,1,STATUS*CEDA\r\n
 5. STM32 是否实现本文档规定的 `$ACK/$NACK` 协议。
 6. RK3576 UART9 为 1.8 V，STM32 常为 3.3 V，必须检查双向电平转换和方向。
 7. 用示波器先看 STM32 RX 上是否出现 RK3576 的 115200 波形，再看 STM32 TX 是否有应答。
+8. 发送 `PING` 和 `STATUS`，必须收到协议正确的 `PONG/ACK` 和状态数据，再判真实双向 UART 通过。
 
-阶段 4 判定为部分通过：应用层和 RK3576 TX 通过，真实 MCU RX/TX 闭环不通过。
+阶段 4 判定为部分通过：应用层和软件协议自测通过；真实 MCU UART 因未接线而未测试，不能写成“通过”或“不通过”。
 
 ## 8. 阶段 5：PPS、NMEA、Trigger 和同步
 
@@ -269,6 +265,10 @@ $XVS,1,STATUS*CEDA\r\n
 两颗 IMX586 均已启用 XVS Slave，连续帧间隔约 500 ms，证明 STM32 的固定 2 Hz XVS 已到达两颗传感器。
 
 这只能证明两路跟随同一 XVS 节拍，不能仅靠软件证明曝光起点误差。V4L2 时间戳还包含 sensor 读出、MIPI、ISP 和驱动调度延迟。
+
+当前软件可验收两路 sequence 是否同步推进、时间戳差及长期漂移、gap/duplicate、V4L2 帧完成时间差，以及模拟 trigger/frame_id 绑定逻辑。`SYNC_STATUS delta_ns=12000-17000` 仅代表两路 V4L2 帧完成时间接近，不能等价为曝光起点只差 12-17 us。
+
+真实曝光起点同步精度必须以共享 XVS 为参考，同时观察 XVS 和两颗传感器各自的曝光或输出参考信号。推荐至少三通道示波器或逻辑分析仪；只有一个通道时分次测量只能检查每路是否跟随 XVS，不能证明两颗传感器在同一次触发中的相对误差。
 
 ### 8.2 软件模拟绑定
 
@@ -413,7 +413,11 @@ usb0: UP 192.168.55.1/24
 
 cam0和cam1的抽帧图分别表现为普通视角和鱼眼视角，证明两个UVC图像端点不是同一路画面复制。证据位于`usb_connected/cam0_uvc.jpg`、`cam1_uvc.jpg`以及对应MJPEG文件。
 
-UVC刚打开时序号从0跳到3，报告`dropped: 2`；一次并发压力测试中，开头还出现若干2036字节带error标志的占位帧，约3秒后恢复为完整JPEG。稳态帧连续且文件可解码，但启动瞬态仍应优化，不能判定为全程零丢帧。
+UVC 启动问题已经修复。根因是 standalone 路径在 `STREAMON` 前把两个已经编码好的 MMAP 缓冲区一起排入队列，主机会在约 60 ms 内连续收到两帧，而不是按照约 500 ms 的真实相机节拍收到。现在启动时只预排一个合法 JPEG；首帧 DQBUF 后等待下一张真实相机帧，再填充和 QBUF。分配的缓冲区数量没有减少，只改变首次入队数量，非 standalone 路径保持原行为。
+
+最新双路连续 10 帧实测中，两路 sequence 均为 0-9、无跳号。cam0 第一到第二帧为 516.058 ms，后续约 476-524 ms；cam1 第一到第二帧为 1004.046 ms，后续多数约 480-520 ms。cam1 首间隔 1 秒表示启动时错过一个约 2 Hz 源帧，不是重复帧、伪帧或 sequence 跳号。
+
+随后执行 20 轮双路并发首帧压力测试，共得到 40 个文件：40/40 均实际完成 DQBUF，sequence 都从 0 开始，文件大小为 1,030,351-1,068,716 字节，全部具有 JPEG SOI/EOI，没有 0 字节文件、2036 字节占位帧或小于 100 KB 的异常帧。40 个单帧文件和两个连续 10 帧 MJPEG 文件共 42 个输入全部由 FFmpeg 成功解码，失败数为 0。
 
 ### 10.5 RNDIS、SSH、双HTTP及共存
 
@@ -441,7 +445,7 @@ OK command=uvc-stop target=all usb_gadget=kept rndis=kept
 
 ### 10.7 阶段7判定
 
-eMMC、双UVC、双HTTP、RNDIS ping/SSH、三者共存以及UVC软停止时保留网口均通过。USB3.0链路和UVC启动瞬态未通过，所以阶段7整体仍判部分通过。
+eMMC、双UVC、双HTTP、RNDIS ping/SSH、三者共存、UVC软停止时保留网口，以及 UVC 启动合法帧和节拍均通过。实际物理链路仍为 USB2.0 480M，USB3.0 未通过，所以阶段7整体仍判部分通过。
 
 ## 11. 已知告警如何理解
 
@@ -453,9 +457,13 @@ eMMC、双UVC、双HTTP、RNDIS ping/SSH、三者共存以及UVC软停止时保�
 
 退出/重启时出现 `pool items are still in use`、`trigger_isp_readback buf not ready`。它们是资源释放时序告警，不等价于运行期间的 sequence drop，但产品版本仍应确保先停止输出队列、等待编码任务清空，再停止采集和销毁 AIQ context。
 
+### 11.3 UVC 主机关闭流后的 ENODEV
+
+当前常驻进程日志中没有 `invalid JPEG`、编码失败或崩溃。使用只取一帧的主机测试程序后，板端可能记录 `UVC: Unable to queue buffer: No such device (19)`；这是主机已经执行 `STREAMOFF` 或关闭节点后，板端尚有一次重排缓冲区操作。此时服务仍为 `active`、UDC 仍为 `configured`，下一次打开两路 UVC 均可正常取流，因此不能把该提示判为 JPEG 编码失败或相机掉线。
+
 ## 12. 下一轮应按这个顺序补测
 
-1. 先修通 STM32 UART：必须收到 PONG 和 STATUS，确认实际频率和脉冲计数。
+1. 接好 STM32 UART 后执行真实双向测试：必须收到 PONG 和 STATUS，确认实际频率和脉冲计数。
 2. 让 MCU 固定输出 4 Hz XVS，依次验收 4/4、4/2、2/4、2/2，每种至少 60 秒。
 3. 接 PPS 和 GNSS，看到 `UTC_LOCKED utc_valid=1` 后再保存照片。
 4. 用真实 `EVT,XVS trigger_id/timer_tick` 完成 1000 次触发绑定，要求无 gap、duplicate、overflow。
@@ -470,7 +478,7 @@ eMMC、双UVC、双HTTP、RNDIS ping/SSH、三者共存以及UVC软停止时保�
 
 ```text
 camera-uvc.service = active
-MainPID = 6750
+MainPID = 12804
 NRestarts = 0
 Process = /root/camera_uart/camera_aiq_test --all-daemon
 ```
