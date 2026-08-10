@@ -1080,9 +1080,18 @@ static int
 uvc_video_qbuf_mmap(struct uvc_device *dev)
 {
     unsigned int i;
+    unsigned int initial_buffers;
     int ret;
 
-    for (i = 0; i < dev->nbufs; ++i) {
+    /*
+     * Standalone mode gets frames from the camera application. Queueing all
+     * pre-filled buffers before STREAMON makes the host receive those frames
+     * back-to-back, even when the source frames were captured 500 ms apart.
+     * Keep one buffer in flight and refill it only after DQBUF so USB delivery
+     * follows the actual camera cadence from the first frame onward.
+     */
+    initial_buffers = dev->run_standalone ? 1 : dev->nbufs;
+    for (i = 0; i < initial_buffers; ++i) {
         memset(&dev->mem[i].buf, 0, sizeof(dev->mem[i].buf));
 
         dev->mem[i].buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
