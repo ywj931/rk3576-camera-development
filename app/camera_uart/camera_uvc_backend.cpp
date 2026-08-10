@@ -30,6 +30,7 @@ constexpr uint32_t kMjpegFourcc = 0x47504a4dU;
 struct Nv12Frame {
     std::vector<uint8_t> bytes;
     uint32_t sequence = 0;
+    uint64_t generation = 0;
 };
 
 class MppJpegEncoder {
@@ -228,6 +229,11 @@ struct camera_uvc_channel {
     uint64_t queue_drops = 0;
     uint64_t encode_errors = 0;
     uint64_t jpeg_bytes = 0;
+    uint64_t session_generation = 0;
+    uint64_t invalid_jpeg = 0;
+    uint64_t stale_frames = 0;
+    uint32_t first_sent_sequence = 0;
+    bool first_sent_sequence_valid = false;
     bool pacing_initialized = false;
     std::chrono::steady_clock::time_point next_submit_time;
     std::deque<Nv12Frame> queue;
@@ -258,6 +264,10 @@ int on_uvc_open(unsigned int index, int width, int height, int fcc, int fps) {
     channel.negotiated_fps = fps;
     channel.negotiated_fcc = static_cast<uint32_t>(fcc);
     channel.host_open = true;
+    ++channel.session_generation;
+    channel.queue.clear();
+    channel.first_sent_sequence = 0;
+    channel.first_sent_sequence_valid = false;
     if (width != static_cast<int>(g_active_backend->config.width) ||
         height != static_cast<int>(g_active_backend->config.height) ||
         fcc != static_cast<int>(kMjpegFourcc) || (fps != 2 && fps != 4)) {
@@ -284,6 +294,9 @@ void on_uvc_close(unsigned int index) {
     channel.negotiated_fcc = 0;
     channel.pacing_initialized = false;
     channel.queue.clear();
+    ++channel.session_generation;
+    channel.first_sent_sequence = 0;
+    channel.first_sent_sequence_valid = false;
 }
 
 void reset_statistics(camera_uvc_channel *channel) {
@@ -298,6 +311,10 @@ void reset_statistics(camera_uvc_channel *channel) {
     channel->queue_drops = 0;
     channel->encode_errors = 0;
     channel->jpeg_bytes = 0;
+    channel->invalid_jpeg = 0;
+    channel->stale_frames = 0;
+    channel->first_sent_sequence = 0;
+    channel->first_sent_sequence_valid = false;
     channel->pacing_initialized = false;
     channel->queue.clear();
 }
@@ -315,6 +332,10 @@ void encode_worker(camera_uvc_backend_t *backend, int camera_id) {
                 break;
             frame = std::move(channel.queue.back());
             channel.queue.clear();
+            if (!channel.enabled || frame.generation != channel.session_generation) {
+                ++channel.stale_frames;
+                continue;
+            }
         }
 
         std::vector<uint8_t> jpeg;
@@ -327,11 +348,21 @@ void encode_worker(camera_uvc_backend_t *backend, int camera_id) {
             continue;
         }
 
+        const bool valid_jpeg = jpeg.size() >= 4 &&
+                                jpeg[0] == 0xff && jpeg[1] == 0xd8 &&
+                                jpeg[jpeg.size() - 2] == 0xff &&
+                                jpeg[jpeg.size() - 1] == 0xd9;
+        if (!valid_jpeg) {
+            std::lock_guard<std::mutex> lock(channel.mutex);
+            channel.last_error = CAMERA_UVC_ERR_MPP;
+            ++channel.invalid_jpeg;
+            continue;
+        }
+
         {
             std::lock_guard<std::mutex> lock(channel.mutex);
             ++channel.frames_encoded;
             channel.jpeg_bytes += jpeg.size();
-            channel.last_sequence = frame.sequence;
         }
 
         bool sent = false;
@@ -341,7 +372,8 @@ void encode_worker(camera_uvc_backend_t *backend, int camera_id) {
                 bool host_streaming = false;
                 {
                     std::lock_guard<std::mutex> lock(channel.mutex);
-                    host_streaming = channel.host_streaming;
+                    host_streaming = channel.host_streaming &&
+                                     frame.generation == channel.session_generation;
                 }
                 if (host_streaming)
                     sent = uvc_read_camera_buffer_index(
@@ -352,6 +384,15 @@ void encode_worker(camera_uvc_backend_t *backend, int camera_id) {
         if (sent) {
             std::lock_guard<std::mutex> lock(channel.mutex);
             ++channel.frames_sent;
+            channel.last_sequence = frame.sequence;
+            if (!channel.first_sent_sequence_valid) {
+                channel.first_sent_sequence = frame.sequence;
+                channel.first_sent_sequence_valid = true;
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(channel.mutex);
+            if (frame.generation != channel.session_generation)
+                ++channel.stale_frames;
         }
     }
 }
@@ -572,6 +613,7 @@ int camera_uvc_submit_nv12(camera_uvc_backend_t *backend, int camera_id,
     if (plane0_size < y_size || plane1_size < uv_size)
         return CAMERA_UVC_ERR_ARGUMENT;
 
+    uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lock(channel.mutex);
         if (!channel.enabled || channel.source_camera_id != camera_id)
@@ -580,6 +622,7 @@ int camera_uvc_submit_nv12(camera_uvc_backend_t *backend, int camera_id,
             ++channel.frames_skipped_no_host;
             return CAMERA_UVC_OK;
         }
+        generation = channel.session_generation;
 
         const uint32_t fps = channel.negotiated_fps
                                  ? channel.negotiated_fps
@@ -610,18 +653,22 @@ int camera_uvc_submit_nv12(camera_uvc_backend_t *backend, int camera_id,
     std::memcpy(frame.bytes.data(), plane0, y_size);
     std::memcpy(frame.bytes.data() + y_size, plane1, uv_size);
     frame.sequence = sequence;
+    frame.generation = generation;
 
     {
         std::lock_guard<std::mutex> lock(channel.mutex);
-        if (!channel.enabled || !channel.host_streaming)
+        if (!channel.enabled || !channel.host_streaming ||
+            generation != channel.session_generation) {
+            if (generation != channel.session_generation)
+                ++channel.stale_frames;
             return CAMERA_UVC_OK;
+        }
         if (channel.queue.size() >= kQueueDepth) {
             channel.queue.pop_front();
             ++channel.queue_drops;
         }
         channel.queue.emplace_back(std::move(frame));
         ++channel.frames_submitted;
-        channel.last_sequence = sequence;
         channel.condition.notify_one();
     }
     return CAMERA_UVC_OK;
@@ -657,6 +704,10 @@ int camera_uvc_get_status(camera_uvc_backend_t *backend, int camera_id,
     status->queue_drops = channel.queue_drops;
     status->encode_errors = channel.encode_errors;
     status->jpeg_bytes = channel.jpeg_bytes;
+    status->invalid_jpeg = channel.invalid_jpeg;
+    status->stale_frames = channel.stale_frames;
+    status->first_sent_sequence = channel.first_sent_sequence;
+    status->first_sent_sequence_valid = channel.first_sent_sequence_valid;
     return CAMERA_UVC_OK;
 }
 

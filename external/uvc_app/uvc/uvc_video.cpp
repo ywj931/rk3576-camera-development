@@ -36,6 +36,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -801,7 +802,7 @@ static bool _uvc_buffer_check(struct uvc_video* v, struct uvc_buffer* buffer)
         return false;
 }
 
-static void _uvc_user_fill_buffer(struct uvc_video *v, struct uvc_device *dev, struct v4l2_buffer *buf)
+static int _uvc_user_fill_buffer(struct uvc_video *v, struct uvc_device *dev, struct v4l2_buffer *buf)
 {
     struct uvc_buffer* buffer = NULL;
 
@@ -812,15 +813,14 @@ static void _uvc_user_fill_buffer(struct uvc_video *v, struct uvc_device *dev, s
     }
     if (buffer) {
         if (!_uvc_buffer_check(v, buffer))
-            return;
-        if (_uvc_get_user_run_state(v) && _uvc_video_get_uvc_process(v)) {
-            if (buf->length >= buffer->size && buffer->buffer) {
-                buf->bytesused = buffer->size;
-                memcpy(dev->mem[buf->index].start, buffer->buffer, buffer->size);
-            }
-        } else {
-            buf->bytesused = buf->length;
-        }
+            return -EINVAL;
+        if (!_uvc_get_user_run_state(v) || !_uvc_video_get_uvc_process(v))
+            return -EAGAIN;
+        if (buf->length < buffer->size || !buffer->buffer ||
+            !dev->mem || !dev->mem[buf->index].start)
+            return -EMSGSIZE;
+        buf->bytesused = buffer->size;
+        memcpy(dev->mem[buf->index].start, buffer->buffer, buffer->size);
         buffer = uvc_buffer_pop_front(&v->uvc->read);
         if (!v->buffer_s) {
             v->buffer_s = buffer;
@@ -830,30 +830,35 @@ static void _uvc_user_fill_buffer(struct uvc_video *v, struct uvc_device *dev, s
         }
     } else if (v->buffer_s) {
         if (!_uvc_buffer_check(v, v->buffer_s))
-            return;
-        if (_uvc_get_user_run_state(v) && _uvc_video_get_uvc_process(v)) {
-            if (buf->length >= v->buffer_s->size && v->buffer_s->buffer) {
-                buf->bytesused = v->buffer_s->size;
-                memcpy(dev->mem[buf->index].start, v->buffer_s->buffer, v->buffer_s->size);
-            }
-        }
+            return -EINVAL;
+        if (!_uvc_get_user_run_state(v) || !_uvc_video_get_uvc_process(v))
+            return -EAGAIN;
+        if (buf->length < v->buffer_s->size || !v->buffer_s->buffer ||
+            !dev->mem || !dev->mem[buf->index].start)
+            return -EMSGSIZE;
+        buf->bytesused = v->buffer_s->size;
+        memcpy(dev->mem[buf->index].start, v->buffer_s->buffer,
+               v->buffer_s->size);
+        return 0;
     } else {
-        buf->bytesused = buf->length;
-        memset(dev->mem[buf->index].start, 0, buf->length);
+        return -EAGAIN;
     }
+    return 0;
 }
 
-void uvc_user_fill_buffer(struct uvc_device *dev, struct v4l2_buffer *buf, int id)
+int uvc_user_fill_buffer(struct uvc_device *dev, struct v4l2_buffer *buf, int id)
 {
+    int ret = -ENODEV;
     pthread_mutex_lock(&mtx_v);
     if (_uvc_video_id_check(id)) {
         for (std::list<struct uvc_video*>::iterator i = lst_v.begin(); i != lst_v.end(); ++i) {
             struct uvc_video* l = *i;
             if (id == l->id) {
-                _uvc_user_fill_buffer(l, dev, buf);
+                ret = _uvc_user_fill_buffer(l, dev, buf);
                 break;
             }
         }
     }
     pthread_mutex_unlock(&mtx_v);
+    return ret;
 }

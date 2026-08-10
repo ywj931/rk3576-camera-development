@@ -55,6 +55,10 @@ typedef struct camera_uvc_status {
     uint64_t queue_drops;
     uint64_t encode_errors;
     uint64_t jpeg_bytes;
+    uint64_t invalid_jpeg;
+    uint64_t stale_frames;
+    uint32_t first_sent_sequence;
+    int first_sent_sequence_valid;
 } camera_uvc_status_t;
 
 void camera_uvc_default_config(camera_uvc_config_t *config);

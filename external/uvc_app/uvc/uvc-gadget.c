@@ -908,7 +908,7 @@ uvc_close(struct uvc_device *dev)
  * UVC streaming related
  */
 
-static void
+static int
 uvc_video_fill_buffer(struct uvc_device *dev, struct v4l2_buffer *buf)
 {
 #if 0
@@ -934,7 +934,7 @@ uvc_video_fill_buffer(struct uvc_device *dev, struct v4l2_buffer *buf)
 
     }
 #else
-    uvc_user_fill_buffer(dev, buf, dev->video_id);
+    return uvc_user_fill_buffer(dev, buf, dev->video_id);
 #endif
 }
 
@@ -982,7 +982,11 @@ uvc_video_process(struct uvc_device *dev)
 #ifdef ENABLE_BUFFER_DEBUG
         printf("%d: DeQueued buffer at UVC side = %d\n", dev->video_id, dev->ubuf.index);
 #endif
-        uvc_video_fill_buffer(dev, &dev->ubuf);
+        ret = uvc_video_fill_buffer(dev, &dev->ubuf);
+        if (ret < 0) {
+            dev->uvc_shutdown_requested = 1;
+            return 0;
+        }
 
         ret = ioctl(dev->uvc_fd, VIDIOC_QBUF, &dev->ubuf);
         if (ret < 0) {
@@ -1084,6 +1088,16 @@ uvc_video_qbuf_mmap(struct uvc_device *dev)
         dev->mem[i].buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
         dev->mem[i].buf.memory = V4L2_MEMORY_MMAP;
         dev->mem[i].buf.index = i;
+        dev->mem[i].buf.length = dev->mem[i].length;
+
+        if (dev->run_standalone) {
+            ret = uvc_video_fill_buffer(dev, &dev->mem[i].buf);
+            if (ret < 0) {
+                printf("UVC: no valid initial frame for buffer %u: %s (%d).\n",
+                       i, strerror(-ret), -ret);
+                return ret;
+            }
+        }
 
         ret = ioctl(dev->uvc_fd, VIDIOC_QBUF, &(dev->mem[i].buf));
         if (ret < 0) {
@@ -1381,6 +1395,10 @@ uvc_handle_streamon_event(struct uvc_device *dev)
 
     /* Common setup. */
 
+    if (dev->run_standalone)
+        uvc_control_init_for_video(dev->video_id, dev->width, dev->height,
+                                   dev->fcc, dev->fps);
+
     /* Queue buffers to UVC domain and start streaming. */
     ret = uvc_video_qbuf(dev);
     if (ret < 0)
@@ -1392,8 +1410,9 @@ uvc_handle_streamon_event(struct uvc_device *dev)
         dev->is_streaming = 1;
     }
 
-    uvc_control_init_for_video(dev->video_id, dev->width, dev->height,
-                               dev->fcc, dev->fps);
+    if (!dev->run_standalone)
+        uvc_control_init_for_video(dev->video_id, dev->width, dev->height,
+                                   dev->fcc, dev->fps);
     return 0;
 
 err:

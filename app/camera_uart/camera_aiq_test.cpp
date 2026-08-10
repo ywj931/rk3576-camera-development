@@ -671,6 +671,12 @@ void print_uvc_status(camera_uvc_backend_t *uvc, int camera_id)
               << " queue_drops=" << status.queue_drops
               << " encode_errors=" << status.encode_errors
               << " jpeg_bytes=" << status.jpeg_bytes
+              << " invalid_jpeg=" << status.invalid_jpeg
+              << " stale_frames=" << status.stale_frames
+              << " first_sent_sequence="
+              << (status.first_sent_sequence_valid
+                      ? std::to_string(status.first_sent_sequence)
+                      : "none")
               << " last_sequence=" << status.last_sequence
               << " last_error=" << status.last_error
               << " last_mpp_error=" << status.last_mpp_error << '\n';
@@ -826,7 +832,8 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
                              plane1, plane1_size, &metadata);
 }
 
-void print_result(const char *command, int camera_id, int result)
+void print_result(camera_backend_t *backend, const char *command,
+                  int camera_id, int result)
 {
     if (result == CAMERA_BACKEND_OK) {
         std::cout << "OK command=" << command << " camera_id=" << camera_id
@@ -836,12 +843,15 @@ void print_result(const char *command, int camera_id, int result)
             std::strcmp(command, "iso") == 0) {
             camera_backend_status_t status = {};
             const int status_result =
-                camera_backend_get_status(g_backend_for_result, camera_id,
-                                           &status);
+                camera_backend_get_status(backend, camera_id, &status);
             const bool verified = status_result == CAMERA_BACKEND_OK &&
                                   status.manual_settings_verified != 0;
             std::cout << " verification=" << (verified ? "verified" : "pending")
-                      << " manual_settings_verified=" << (verified ? 1 : 0);
+                      << " manual_settings_verified=" << (verified ? 1 : 0)
+                      << " manual_settings_pending="
+                      << (status_result == CAMERA_BACKEND_OK
+                              ? status.manual_settings_pending
+                              : 0);
         }
         std::cout << '\n';
     } else {
@@ -914,7 +924,7 @@ void switch_xvs_camera_fps(camera_backend_t *backend,
     const int query_xvs_result =
         camera_backend_get_xvs_fps(backend, camera_id, &previous_fps);
     if (query_xvs_result != CAMERA_BACKEND_OK) {
-        print_result("fps-xvs-query", camera_id, query_xvs_result);
+        print_result(backend, "fps-xvs-query", camera_id, query_xvs_result);
         return;
     }
     if (previous_fps == fps) {
@@ -954,7 +964,7 @@ void switch_xvs_camera_fps(camera_backend_t *backend,
         const int set_result =
             camera_backend_set_xvs_fps(backend, camera_id, fps);
         if (set_result != CAMERA_BACKEND_OK) {
-            print_result("fps-xvs-thin", camera_id, set_result);
+            print_result(backend, "fps-xvs-thin", camera_id, set_result);
             if (before.running)
                 capture_backend_start_stream(capture, camera_id);
             return;
@@ -1801,7 +1811,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             invalid_command(command, "auto CAMERA_ID");
             return true;
         }
-        print_result(command.c_str(), camera_id,
+        print_result(backend, command.c_str(), camera_id,
                      camera_backend_set_auto(backend, camera_id));
         return true;
     }
@@ -1818,7 +1828,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             invalid_command(command, "exposure CAMERA_ID EXPOSURE_US");
             return true;
         }
-        print_result(command.c_str(), camera_id,
+        print_result(backend, command.c_str(), camera_id,
                      camera_backend_set_exposure(backend, camera_id,
                                                  exposure_us));
         return true;
@@ -1836,7 +1846,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             invalid_command(command, "gain CAMERA_ID GAIN_X1000");
             return true;
         }
-        print_result(command.c_str(), camera_id,
+        print_result(backend, command.c_str(), camera_id,
                      camera_backend_set_gain(backend, camera_id,
                                              gain_x1000));
         return true;
@@ -1854,7 +1864,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             invalid_command(command, "iso CAMERA_ID ISO");
             return true;
         }
-        print_result(command.c_str(), camera_id,
+        print_result(backend, command.c_str(), camera_id,
                      camera_backend_set_iso(backend, camera_id, iso));
         return true;
     }
