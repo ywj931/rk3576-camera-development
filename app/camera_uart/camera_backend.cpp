@@ -38,8 +38,6 @@ constexpr unsigned long kSetXvsInputThin =
     _IOW('V', BASE_VIDIOC_PRIVATE + 47, uint32_t);
 constexpr unsigned long kGetXvsInputThin =
     _IOR('V', BASE_VIDIOC_PRIVATE + 48, uint32_t);
-constexpr int kManualVerifyAttempts = 40;
-constexpr auto kManualVerifyInterval = std::chrono::milliseconds(100);
 constexpr uint32_t kStreamStartEvent = V4L2_EVENT_PRIVATE_START + 1;
 constexpr uint32_t kStreamStopEvent = V4L2_EVENT_PRIVATE_START + 2;
 
@@ -236,34 +234,32 @@ int apply_manual_target(CameraSlot &camera, const char *operation)
 
     camera.manual_mode = true;
     camera.manual_settings_verified = false;
-    for (int attempt = 0; attempt < kManualVerifyAttempts; ++attempt) {
-        ae_api_queryInfo_t query = {};
-        XCamReturn query_result =
-            rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &query);
-        if (query_result == XCAM_RETURN_NO_ERROR && valid_linear_query(query)) {
-            const uint32_t exposure_us = to_u32_rounded(
-                query.linExpInfo.expParam.integration_time * 1000000.0f);
-            const uint32_t gain_x1000 = to_u32_rounded(
-                query.linExpInfo.expParam.analog_gain * 1000.0f);
-            if (within_tolerance(exposure_us, camera.requested_exposure_us,
-                                 100U) &&
-                within_tolerance(gain_x1000, camera.requested_gain_x1000,
-                                 50U)) {
-                camera.manual_settings_verified = true;
-                camera.last_aiq_error = 0;
-                return CAMERA_BACKEND_OK;
-            }
-        } else if (query_result != XCAM_RETURN_NO_ERROR) {
-            camera.last_aiq_error = static_cast<int>(query_result);
-        }
-        std::this_thread::sleep_for(kManualVerifyInterval);
+    /*
+     * RKAIQ applies manual AE on a subsequent sensor frame. At 1-2 Hz a
+     * bounded polling loop can expire before that frame exists and report a
+     * false failure. The set API result is authoritative here; status() below
+     * performs the eventual frame-backed verification.
+     */
+    ae_api_queryInfo_t query = {};
+    const XCamReturn query_result =
+        rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &query);
+    if (query_result == XCAM_RETURN_NO_ERROR && valid_linear_query(query)) {
+        const uint32_t exposure_us = to_u32_rounded(
+            query.linExpInfo.expParam.integration_time * 1000000.0f);
+        const uint32_t gain_x1000 = to_u32_rounded(
+            query.linExpInfo.expParam.analog_gain * 1000.0f);
+        camera.manual_settings_verified =
+            within_tolerance(exposure_us, camera.requested_exposure_us, 100U) &&
+            within_tolerance(gain_x1000, camera.requested_gain_x1000, 50U);
     }
-
-    std::fprintf(stderr,
-                 "CAMERA_VERIFY_ERROR sensor=%s requested_exposure_us=%u requested_gain_x1000=%u\n",
-                 camera.sensor_name.c_str(), camera.requested_exposure_us,
-                 camera.requested_gain_x1000);
-    return CAMERA_BACKEND_ERR_VERIFY;
+    camera.last_aiq_error = 0;
+    if (!camera.manual_settings_verified) {
+        std::fprintf(stderr,
+                     "CAMERA_VERIFY_PENDING sensor=%s requested_exposure_us=%u requested_gain_x1000=%u\n",
+                     camera.sensor_name.c_str(), camera.requested_exposure_us,
+                     camera.requested_gain_x1000);
+    }
+    return CAMERA_BACKEND_OK;
 }
 
 void reset_manual_target(CameraSlot &camera)
@@ -761,6 +757,8 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
     status->started = camera.started;
     status->manual_mode = camera.manual_mode;
     status->manual_settings_verified = camera.manual_settings_verified;
+    status->manual_settings_pending =
+        camera.manual_target_valid && !camera.manual_settings_verified;
     status->requested_exposure_us = camera.requested_exposure_us;
     status->requested_gain_x1000 = camera.requested_gain_x1000;
     status->requested_iso = camera.requested_iso;
@@ -830,6 +828,8 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
                                  camera.requested_gain_x1000, 50U);
             camera.manual_settings_verified =
                 status->manual_settings_verified != 0;
+            status->manual_settings_pending =
+                !camera.manual_settings_verified;
         }
     } else if (camera.requested_fps != 0) {
         status->fps_x1000 = camera.requested_fps * 1000;

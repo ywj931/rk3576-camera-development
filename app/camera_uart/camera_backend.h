@@ -45,6 +45,7 @@ typedef struct camera_backend_status {
     int aiq_iso;
     int iso_estimated;
     int manual_settings_verified;
+    int manual_settings_pending;
     int last_aiq_error;
     uint32_t exposure_us;
     uint32_t gain_x1000;

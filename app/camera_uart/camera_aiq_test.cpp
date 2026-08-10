@@ -210,6 +210,8 @@ void print_status(camera_backend_t *backend, int camera_id)
               << " xvs_input_thin=" << status.xvs_input_thin
               << " manual_settings_verified="
               << status.manual_settings_verified
+              << " manual_settings_pending="
+              << status.manual_settings_pending
               << " mean_luma=" << status.mean_luma
               << " converged=" << status.converged
               << " last_aiq_error=" << status.last_aiq_error
@@ -828,7 +830,20 @@ void print_result(const char *command, int camera_id, int result)
 {
     if (result == CAMERA_BACKEND_OK) {
         std::cout << "OK command=" << command << " camera_id=" << camera_id
-                  << '\n';
+                  ;
+        if (std::strcmp(command, "exposure") == 0 ||
+            std::strcmp(command, "gain") == 0 ||
+            std::strcmp(command, "iso") == 0) {
+            camera_backend_status_t status = {};
+            const int status_result =
+                camera_backend_get_status(g_backend_for_result, camera_id,
+                                           &status);
+            const bool verified = status_result == CAMERA_BACKEND_OK &&
+                                  status.manual_settings_verified != 0;
+            std::cout << " verification=" << (verified ? "verified" : "pending")
+                      << " manual_settings_verified=" << (verified ? 1 : 0);
+        }
+        std::cout << '\n';
     } else {
         std::cout << "ERROR command=" << command << " camera_id=" << camera_id
                   << " code=" << result
