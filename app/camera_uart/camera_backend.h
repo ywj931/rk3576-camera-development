@@ -46,14 +46,6 @@ typedef struct camera_backend_status {
     int iso_estimated;
     int manual_settings_verified;
     int manual_settings_pending;
-    uint64_t manual_request_id;
-    int manual_request_sequence_valid;
-    uint32_t manual_request_sequence;
-    int manual_verified_sequence_valid;
-    uint32_t manual_verified_sequence;
-    uint32_t manual_verification_frames;
-    uint64_t manual_verification_latency_ms;
-    uint64_t manual_request_age_ms;
     int last_aiq_error;
     uint32_t exposure_us;
     uint32_t gain_x1000;
@@ -85,9 +77,6 @@ int camera_backend_create(const camera_backend_config_t *config,
 void camera_backend_destroy(camera_backend_t *backend);
 
 int camera_backend_set_auto(camera_backend_t *backend, int camera_id);
-/* Sets exposure and analog gain in one RKAIQ transaction. */
-int camera_backend_set_manual(camera_backend_t *backend, int camera_id,
-                              uint32_t exposure_us, uint32_t gain_x1000);
 /* Sets exposure while preserving the current measured analog gain. */
 int camera_backend_set_exposure(camera_backend_t *backend, int camera_id,
                                 uint32_t exposure_us);
@@ -106,9 +95,6 @@ int camera_backend_get_xvs_fps(camera_backend_t *backend, int camera_id,
                                uint32_t *fps);
 int camera_backend_get_status(camera_backend_t *backend, int camera_id,
                               camera_backend_status_t *status);
-/* Records a completed V4L2 frame for asynchronous manual-setting verification. */
-int camera_backend_note_frame(camera_backend_t *backend, int camera_id,
-                              uint32_t sequence);
 
 const char *camera_backend_strerror(int result);
 

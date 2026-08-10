@@ -162,10 +162,8 @@ net-stop [CAMERA_ID|all]
 net-status [CAMERA_ID|all]
 
 auto CAMERA_ID
-manual CAMERA_ID EXPOSURE_US GAIN_X1000
 exposure CAMERA_ID EXPOSURE_US
 gain CAMERA_ID GAIN_X1000
-iso CAMERA_ID ISO
 fps CAMERA_ID FPS
 
 wait MILLISECONDS
@@ -176,20 +174,9 @@ quit
 参数说明：
 
 - `camera_id` 为 `0` 或 `1`，所有控制和保存状态均按相机隔离。
-- 同时修改曝光和增益时使用 `manual`。该命令只向 RKAIQ 提交一次完整的手动
-  AE 目标，避免连续执行 `exposure`、`gain`、`iso` 时反复重新开始生效确认。
 - `exposure_us` 单位为微秒。设置曝光时先读取并保持当前实际模拟增益。
 - `gain_x1000` 是 IMX586 传感器模拟增益，范围 `1000`～`64000`，`8000` 表示 8 倍。设置增益时先读取并保持当前实际曝光时间。
-- `iso` 和 `gain` 是同一物理模拟增益的两种输入方式，本程序按基础 ISO 50
-  换算，单次目标二选一，不要先执行 `gain` 再执行 `iso`。
-- `OK ... manual_settings_pending=1` 表示 RKAIQ 已接受目标，但还没有在请求后的
-  新帧上完成回读确认。每收到一个新的 V4L2 sequence，后台线程最多查询一次；
-  首次匹配后自动输出 `CAMERA_VERIFY_COMPLETE`。
-- `status` 中的 `manual_verification_frames` 是从提交时最近一帧到首次匹配帧的
-  sequence 差，`manual_verification_latency_ms` 是对应耗时。2 Hz 每帧约 500 ms，
-  因而物理生效不可能是即时的；应按帧数判断，不能用固定 `wait 3500` 判断。
-- `manual_verified_sequence` 表示应用层首次观察到 RKAIQ 回读匹配的采集帧，不能
-  替代示波器对真实曝光起点的硬件精度验收。
+- ISO 由 RKAIQ 根据模拟增益、数字增益、ISP 增益和 IQ 计算，只在 `status` 中回读。
 - `OUTPUT_DIR` 必须是没有空格的绝对路径。程序会创建不存在的目录。
 - `save-start` 只在该路已经 `stream-start` 后成功。
 - `save-stop` 停止接收新保存帧，并等待已经进入写盘队列的帧处理完成后返回。

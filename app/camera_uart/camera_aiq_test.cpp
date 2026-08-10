@@ -136,7 +136,6 @@ void print_commands()
         << "Commands:\n"
         << "  status [all|0|1]\n"
         << "  auto CAMERA_ID\n"
-        << "  manual CAMERA_ID EXPOSURE_US GAIN_X1000\n"
         << "  exposure CAMERA_ID EXPOSURE_US\n"
         << "  gain CAMERA_ID GAIN_X1000\n"
         << "  iso CAMERA_ID ISO\n"
@@ -213,20 +212,6 @@ void print_status(camera_backend_t *backend, int camera_id)
               << status.manual_settings_verified
               << " manual_settings_pending="
               << status.manual_settings_pending
-              << " manual_request_id=" << status.manual_request_id
-              << " manual_request_sequence_valid="
-              << status.manual_request_sequence_valid
-              << " manual_request_sequence="
-              << status.manual_request_sequence
-              << " manual_verified_sequence_valid="
-              << status.manual_verified_sequence_valid
-              << " manual_verified_sequence="
-              << status.manual_verified_sequence
-              << " manual_verification_frames="
-              << status.manual_verification_frames
-              << " manual_verification_latency_ms="
-              << status.manual_verification_latency_ms
-              << " manual_request_age_ms=" << status.manual_request_age_ms
               << " mean_luma=" << status.mean_luma
               << " converged=" << status.converged
               << " last_aiq_error=" << status.last_aiq_error
@@ -782,8 +767,6 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
                         uint32_t sequence, void *user_data)
 {
     output_backends *outputs = static_cast<output_backends *>(user_data);
-    if (outputs->camera)
-        camera_backend_note_frame(outputs->camera, camera_id, sequence);
     if (outputs->uvc) {
         camera_uvc_submit_nv12(outputs->uvc, camera_id, plane0, plane0_size,
                                plane1, plane1_size, sequence);
@@ -855,8 +838,7 @@ void print_result(camera_backend_t *backend, const char *command,
     if (result == CAMERA_BACKEND_OK) {
         std::cout << "OK command=" << command << " camera_id=" << camera_id
                   ;
-        if (std::strcmp(command, "manual") == 0 ||
-            std::strcmp(command, "exposure") == 0 ||
+        if (std::strcmp(command, "exposure") == 0 ||
             std::strcmp(command, "gain") == 0 ||
             std::strcmp(command, "iso") == 0) {
             camera_backend_status_t status = {};
@@ -869,18 +851,6 @@ void print_result(camera_backend_t *backend, const char *command,
                       << " manual_settings_pending="
                       << (status_result == CAMERA_BACKEND_OK
                               ? status.manual_settings_pending
-                              : 0)
-                      << " manual_request_id="
-                      << (status_result == CAMERA_BACKEND_OK
-                              ? status.manual_request_id
-                              : 0)
-                      << " manual_request_sequence_valid="
-                      << (status_result == CAMERA_BACKEND_OK
-                              ? status.manual_request_sequence_valid
-                              : 0)
-                      << " manual_request_sequence="
-                      << (status_result == CAMERA_BACKEND_OK
-                              ? status.manual_request_sequence
                               : 0);
         }
         std::cout << '\n';
@@ -1026,15 +996,18 @@ void switch_xvs_camera_fps(camera_backend_t *backend,
             return;
         }
         if (preserve_manual) {
-            const int manual_result = camera_backend_set_manual(
-                backend, camera_id, preserved.exposure_us,
-                preserved.gain_x1000);
+            const int exposure_result = camera_backend_set_exposure(
+                backend, camera_id, preserved.exposure_us);
+            const int gain_result = camera_backend_set_gain(
+                backend, camera_id, preserved.gain_x1000);
             manual_parameters_restored =
-                manual_result == CAMERA_BACKEND_OK;
+                exposure_result == CAMERA_BACKEND_OK &&
+                gain_result == CAMERA_BACKEND_OK;
             if (!manual_parameters_restored) {
                 std::cout << "ERROR command=fps camera_id=" << camera_id
                           << " reason=\"manual exposure/gain restore failed\""
-                          << " manual_result=" << manual_result << '\n';
+                          << " exposure_result=" << exposure_result
+                          << " gain_result=" << gain_result << '\n';
                 return;
             }
         }
@@ -1858,28 +1831,6 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
         print_result(backend, command.c_str(), camera_id,
                      camera_backend_set_exposure(backend, camera_id,
                                                  exposure_us));
-        return true;
-    }
-
-    if (command == "manual") {
-        std::string camera_text;
-        std::string exposure_text;
-        std::string gain_text;
-        std::string extra;
-        int camera_id = -1;
-        uint32_t exposure_us = 0;
-        uint32_t gain_x1000 = 0;
-        if (!(stream >> camera_text >> exposure_text >> gain_text) ||
-            (stream >> extra) || !parse_camera_id(camera_text, &camera_id) ||
-            !parse_u32(exposure_text, &exposure_us) ||
-            !parse_u32(gain_text, &gain_x1000)) {
-            invalid_command(command,
-                            "manual CAMERA_ID EXPOSURE_US GAIN_X1000");
-            return true;
-        }
-        print_result(backend, command.c_str(), camera_id,
-                     camera_backend_set_manual(backend, camera_id,
-                                               exposure_us, gain_x1000));
         return true;
     }
 
