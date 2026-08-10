@@ -262,6 +262,15 @@ int translate(const request &input, std::string *command,
             return ERR_PROTOCOL;
         }
         *command = "exposure " + target + " " + input.arguments[0];
+    } else if (input.operation == "MANUAL") {
+        if (!require_camera() || !require_arguments(2)) return ERR_PROTOCOL;
+        if (!is_unsigned_number(input.arguments[0]) ||
+            !is_unsigned_number(input.arguments[1])) {
+            *reason = "BAD_NUMBER";
+            return ERR_PROTOCOL;
+        }
+        *command = "manual " + target + " " + input.arguments[0] + " " +
+                   input.arguments[1];
     } else if (input.operation == "GAIN") {
         if (!require_camera() || !require_arguments(1)) return ERR_PROTOCOL;
         if (!is_unsigned_number(input.arguments[0])) {
@@ -269,6 +278,13 @@ int translate(const request &input, std::string *command,
             return ERR_PROTOCOL;
         }
         *command = "gain " + target + " " + input.arguments[0];
+    } else if (input.operation == "ISO") {
+        if (!require_camera() || !require_arguments(1)) return ERR_PROTOCOL;
+        if (!is_unsigned_number(input.arguments[0])) {
+            *reason = "BAD_NUMBER";
+            return ERR_PROTOCOL;
+        }
+        *command = "iso " + target + " " + input.arguments[0];
     } else if (input.operation == "FPS") {
         if (!require_camera() || !require_arguments(1)) return ERR_PROTOCOL;
         if (!is_unsigned_number(input.arguments[0])) {
@@ -486,6 +502,8 @@ int protocol_self_test(std::string *report)
         {"$CAM,5,1,NET_START", "net-start 1", true},
         {"$CAM,6,0,EXPOSURE,30000", "exposure 0 30000", true},
         {"$CAM,7,1,GAIN,8000", "gain 1 8000", true},
+        {"$CAM,7,0,MANUAL,5000,3000", "manual 0 5000 3000", true},
+        {"$CAM,7,1,ISO,300", "iso 1 300", true},
         {"$CAM,8,255,SYNC_START,2,10", "sync-start 2 10", true},
         {"$CAM,9,255,TIME_STATUS", "time-sync-status", true},
         {"$CAM,10,255,TIME_RESET", "time-sync-reset", true},

@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -48,6 +49,18 @@ struct CameraSlot {
     bool manual_mode = false;
     bool manual_target_valid = false;
     bool manual_settings_verified = false;
+    uint64_t manual_request_id = 0;
+    bool manual_request_sequence_valid = false;
+    uint32_t manual_request_sequence = 0;
+    bool manual_verified_sequence_valid = false;
+    uint32_t manual_verified_sequence = 0;
+    uint32_t manual_verification_frames = 0;
+    uint64_t manual_request_monotonic_ns = 0;
+    uint64_t manual_verification_latency_ms = 0;
+    bool last_frame_sequence_valid = false;
+    uint32_t last_frame_sequence = 0;
+    bool last_verification_query_sequence_valid = false;
+    uint32_t last_verification_query_sequence = 0;
     uint32_t requested_exposure_us = 0;
     uint32_t requested_gain_x1000 = 0;
     uint32_t requested_iso = 0;
@@ -60,7 +73,18 @@ struct CameraSlot {
     int event_fd = -1;
     std::atomic<bool> stop_event_thread{false};
     std::thread event_thread;
+    std::condition_variable verification_cv;
+    std::atomic<bool> stop_verification_thread{false};
+    std::thread verification_thread;
 };
+
+uint64_t monotonic_now_ns()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
 
 bool directory_exists(const char *path)
 {
@@ -234,32 +258,103 @@ int apply_manual_target(CameraSlot &camera, const char *operation)
 
     camera.manual_mode = true;
     camera.manual_settings_verified = false;
-    /*
-     * RKAIQ applies manual AE on a subsequent sensor frame. At 1-2 Hz a
-     * bounded polling loop can expire before that frame exists and report a
-     * false failure. The set API result is authoritative here; status() below
-     * performs the eventual frame-backed verification.
-     */
-    ae_api_queryInfo_t query = {};
-    const XCamReturn query_result =
-        rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &query);
-    if (query_result == XCAM_RETURN_NO_ERROR && valid_linear_query(query)) {
-        const uint32_t exposure_us = to_u32_rounded(
-            query.linExpInfo.expParam.integration_time * 1000000.0f);
-        const uint32_t gain_x1000 = to_u32_rounded(
-            query.linExpInfo.expParam.analog_gain * 1000.0f);
-        camera.manual_settings_verified =
-            within_tolerance(exposure_us, camera.requested_exposure_us, 100U) &&
-            within_tolerance(gain_x1000, camera.requested_gain_x1000, 50U);
-    }
+    ++camera.manual_request_id;
+    camera.manual_request_sequence_valid = camera.last_frame_sequence_valid;
+    camera.manual_request_sequence = camera.last_frame_sequence;
+    camera.manual_verified_sequence_valid = false;
+    camera.manual_verified_sequence = 0;
+    camera.manual_verification_frames = 0;
+    camera.manual_request_monotonic_ns = monotonic_now_ns();
+    camera.manual_verification_latency_ms = 0;
+    camera.last_verification_query_sequence_valid = false;
     camera.last_aiq_error = 0;
-    if (!camera.manual_settings_verified) {
-        std::fprintf(stderr,
-                     "CAMERA_VERIFY_PENDING sensor=%s requested_exposure_us=%u requested_gain_x1000=%u\n",
-                     camera.sensor_name.c_str(), camera.requested_exposure_us,
-                     camera.requested_gain_x1000);
-    }
+    std::fprintf(stderr,
+                 "CAMERA_VERIFY_PENDING sensor=%s request_id=%llu request_sequence_valid=%d request_sequence=%u requested_exposure_us=%u requested_gain_x1000=%u\n",
+                 camera.sensor_name.c_str(),
+                 static_cast<unsigned long long>(camera.manual_request_id),
+                 camera.manual_request_sequence_valid ? 1 : 0,
+                 camera.manual_request_sequence, camera.requested_exposure_us,
+                 camera.requested_gain_x1000);
+    camera.verification_cv.notify_one();
     return CAMERA_BACKEND_OK;
+}
+
+void update_manual_verification(CameraSlot &camera,
+                                const ae_api_queryInfo_t &query,
+                                uint32_t sequence)
+{
+    if (!camera.manual_target_valid || camera.manual_settings_verified ||
+        !valid_linear_query(query)) {
+        return;
+    }
+    if (camera.manual_request_sequence_valid &&
+        sequence == camera.manual_request_sequence) {
+        return;
+    }
+
+    const uint32_t exposure_us = to_u32_rounded(
+        query.linExpInfo.expParam.integration_time * 1000000.0f);
+    const uint32_t gain_x1000 = to_u32_rounded(
+        query.linExpInfo.expParam.analog_gain * 1000.0f);
+    if (!within_tolerance(exposure_us, camera.requested_exposure_us, 100U) ||
+        !within_tolerance(gain_x1000, camera.requested_gain_x1000, 50U)) {
+        return;
+    }
+
+    camera.manual_settings_verified = true;
+    camera.manual_verified_sequence_valid = true;
+    camera.manual_verified_sequence = sequence;
+    camera.manual_verification_frames = camera.manual_request_sequence_valid
+                                            ? sequence - camera.manual_request_sequence
+                                            : 1U;
+    const uint64_t now_ns = monotonic_now_ns();
+    camera.manual_verification_latency_ms =
+        now_ns >= camera.manual_request_monotonic_ns
+            ? (now_ns - camera.manual_request_monotonic_ns) / 1000000ULL
+            : 0;
+    std::fprintf(stdout,
+                 "CAMERA_VERIFY_COMPLETE sensor=%s request_id=%llu request_sequence_valid=%d request_sequence=%u verified_sequence=%u verification_frames=%u verification_latency_ms=%llu exposure_us=%u gain_x1000=%u\n",
+                 camera.sensor_name.c_str(),
+                 static_cast<unsigned long long>(camera.manual_request_id),
+                 camera.manual_request_sequence_valid ? 1 : 0,
+                 camera.manual_request_sequence, camera.manual_verified_sequence,
+                 camera.manual_verification_frames,
+                 static_cast<unsigned long long>(
+                     camera.manual_verification_latency_ms),
+                 exposure_us, gain_x1000);
+    std::fflush(stdout);
+}
+
+void manual_verification_worker(CameraSlot *camera)
+{
+    std::unique_lock<std::mutex> lock(camera->mutex);
+    while (!camera->stop_verification_thread.load()) {
+        camera->verification_cv.wait(lock, [&] {
+            return camera->stop_verification_thread.load() ||
+                   (camera->ctx != nullptr && camera->started &&
+                    camera->manual_target_valid &&
+                    !camera->manual_settings_verified &&
+                    camera->last_frame_sequence_valid &&
+                    (!camera->last_verification_query_sequence_valid ||
+                     camera->last_verification_query_sequence !=
+                         camera->last_frame_sequence));
+        });
+        if (camera->stop_verification_thread.load())
+            break;
+
+        const uint32_t sequence = camera->last_frame_sequence;
+        camera->last_verification_query_sequence = sequence;
+        camera->last_verification_query_sequence_valid = true;
+        ae_api_queryInfo_t query = {};
+        const XCamReturn query_result =
+            rk_aiq_user_api2_ae_queryExpResInfo(camera->ctx, &query);
+        if (query_result == XCAM_RETURN_NO_ERROR) {
+            update_manual_verification(*camera, query, sequence);
+            camera->last_aiq_error = 0;
+        } else {
+            camera->last_aiq_error = static_cast<int>(query_result);
+        }
+    }
 }
 
 void reset_manual_target(CameraSlot &camera)
@@ -267,9 +362,25 @@ void reset_manual_target(CameraSlot &camera)
     camera.manual_mode = false;
     camera.manual_target_valid = false;
     camera.manual_settings_verified = false;
+    camera.manual_request_sequence_valid = false;
+    camera.manual_request_sequence = 0;
+    camera.manual_verified_sequence_valid = false;
+    camera.manual_verified_sequence = 0;
+    camera.manual_verification_frames = 0;
+    camera.manual_request_monotonic_ns = 0;
+    camera.manual_verification_latency_ms = 0;
+    camera.last_verification_query_sequence_valid = false;
     camera.requested_exposure_us = 0;
     camera.requested_gain_x1000 = 0;
     camera.requested_iso = 0;
+}
+
+void stop_verification_worker(CameraSlot &camera)
+{
+    camera.stop_verification_thread.store(true);
+    camera.verification_cv.notify_all();
+    if (camera.verification_thread.joinable())
+        camera.verification_thread.join();
 }
 
 int set_stream_event_subscription(int fd, uint32_t event_type, bool subscribe)
@@ -327,6 +438,8 @@ void stream_event_worker(CameraSlot *camera)
                 CAMERA_BACKEND_OK) {
                 camera->started = false;
                 reset_manual_target(*camera);
+                camera->last_frame_sequence_valid = false;
+                camera->last_frame_sequence = 0;
                 std::fprintf(stdout,
                              "CAMERA_STREAM sensor=%s state=STOPPED params=%s\n",
                              camera->sensor_name.c_str(),
@@ -528,6 +641,8 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
 
         try {
             camera.event_thread = std::thread(stream_event_worker, &camera);
+            camera.verification_thread =
+                std::thread(manual_verification_worker, &camera);
         } catch (...) {
             std::fprintf(stderr,
                          "CAMERA_EVENT_ERROR camera_id=%d params=%s operation=thread\n",
@@ -548,10 +663,13 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
         for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
              ++camera_id) {
             backend->cameras[camera_id].stop_event_thread.store(true);
+            backend->cameras[camera_id].stop_verification_thread.store(true);
+            backend->cameras[camera_id].verification_cv.notify_all();
         }
         for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
              ++camera_id) {
             stop_event_worker(backend->cameras[camera_id]);
+            stop_verification_worker(backend->cameras[camera_id]);
         }
         for (int camera_id = CAMERA_BACKEND_CAMERA_COUNT - 1; camera_id >= 0;
              --camera_id) {
@@ -572,6 +690,10 @@ extern "C" void camera_backend_destroy(camera_backend_t *backend)
 
     for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
          ++camera_id) {
+        stop_verification_worker(backend->cameras[camera_id]);
+    }
+    for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
+         ++camera_id) {
         backend->cameras[camera_id].stop_event_thread.store(true);
     }
     for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
@@ -585,6 +707,31 @@ extern "C" void camera_backend_destroy(camera_backend_t *backend)
         shutdown_camera(backend->cameras[camera_id]);
     }
     delete backend;
+}
+
+extern "C" int camera_backend_set_manual(camera_backend_t *backend,
+                                           int camera_id,
+                                           uint32_t exposure_us,
+                                           uint32_t gain_x1000)
+{
+    int result = validate_camera_id(backend, camera_id);
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+    if (exposure_us < kMinExposureUs || exposure_us > kMaxExposureUs ||
+        gain_x1000 < kMinGainX1000 || gain_x1000 > kMaxGainX1000) {
+        return CAMERA_BACKEND_ERR_RANGE;
+    }
+
+    CameraSlot &camera = backend->cameras[camera_id];
+    std::lock_guard<std::mutex> lock(camera.mutex);
+    if (camera.ctx == nullptr || !camera.started)
+        return CAMERA_BACKEND_ERR_NOT_READY;
+
+    camera.requested_exposure_us = exposure_us;
+    camera.requested_gain_x1000 = gain_x1000;
+    camera.requested_iso = (gain_x1000 * kBaseIso + 500U) / 1000U;
+    camera.manual_target_valid = true;
+    return apply_manual_target(camera, "setExpSwAttr(manual)");
 }
 
 extern "C" int camera_backend_set_auto(camera_backend_t *backend,
@@ -759,6 +906,29 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
     status->manual_settings_verified = camera.manual_settings_verified;
     status->manual_settings_pending =
         camera.manual_target_valid && !camera.manual_settings_verified;
+    status->manual_request_id = camera.manual_request_id;
+    status->manual_request_sequence_valid =
+        camera.manual_request_sequence_valid ? 1 : 0;
+    status->manual_request_sequence = camera.manual_request_sequence;
+    status->manual_verified_sequence_valid =
+        camera.manual_verified_sequence_valid ? 1 : 0;
+    status->manual_verified_sequence = camera.manual_verified_sequence;
+    status->manual_verification_frames = camera.manual_verification_frames;
+    status->manual_verification_latency_ms =
+        camera.manual_verification_latency_ms;
+    if (camera.manual_request_monotonic_ns != 0) {
+        if (camera.manual_settings_verified) {
+            status->manual_request_age_ms =
+                camera.manual_verification_latency_ms;
+        } else {
+            const uint64_t now_ns = monotonic_now_ns();
+            status->manual_request_age_ms =
+                now_ns >= camera.manual_request_monotonic_ns
+                    ? (now_ns - camera.manual_request_monotonic_ns) /
+                          1000000ULL
+                    : 0;
+        }
+    }
     status->requested_exposure_us = camera.requested_exposure_us;
     status->requested_gain_x1000 = camera.requested_gain_x1000;
     status->requested_iso = camera.requested_iso;
@@ -820,17 +990,27 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
                                 ? camera.requested_fps * 1000U
                                 : to_u32_rounded(query.fps * 1000.0f);
         status->mean_luma = query.linExpInfo.meanLuma;
-        if (camera.manual_target_valid) {
-            status->manual_settings_verified =
-                within_tolerance(status->exposure_us,
-                                 camera.requested_exposure_us, 100U) &&
-                within_tolerance(status->gain_x1000,
-                                 camera.requested_gain_x1000, 50U);
-            camera.manual_settings_verified =
-                status->manual_settings_verified != 0;
-            status->manual_settings_pending =
-                !camera.manual_settings_verified;
+        if (camera.manual_target_valid && !camera.manual_settings_verified &&
+            camera.last_frame_sequence_valid &&
+            (!camera.last_verification_query_sequence_valid ||
+             camera.last_verification_query_sequence !=
+                 camera.last_frame_sequence)) {
+            camera.last_verification_query_sequence =
+                camera.last_frame_sequence;
+            camera.last_verification_query_sequence_valid = true;
+            update_manual_verification(camera, query,
+                                       camera.last_frame_sequence);
         }
+        status->manual_settings_verified =
+            camera.manual_settings_verified ? 1 : 0;
+        status->manual_settings_pending =
+            camera.manual_target_valid && !camera.manual_settings_verified;
+        status->manual_verified_sequence_valid =
+            camera.manual_verified_sequence_valid ? 1 : 0;
+        status->manual_verified_sequence = camera.manual_verified_sequence;
+        status->manual_verification_frames = camera.manual_verification_frames;
+        status->manual_verification_latency_ms =
+            camera.manual_verification_latency_ms;
     } else if (camera.requested_fps != 0) {
         status->fps_x1000 = camera.requested_fps * 1000;
     }
@@ -842,6 +1022,23 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
     else
         status->last_aiq_error = 0;
 
+    return CAMERA_BACKEND_OK;
+}
+
+extern "C" int camera_backend_note_frame(camera_backend_t *backend,
+                                          int camera_id, uint32_t sequence)
+{
+    int result = validate_camera_id(backend, camera_id);
+    if (result != CAMERA_BACKEND_OK)
+        return result;
+
+    CameraSlot &camera = backend->cameras[camera_id];
+    {
+        std::lock_guard<std::mutex> lock(camera.mutex);
+        camera.last_frame_sequence = sequence;
+        camera.last_frame_sequence_valid = true;
+    }
+    camera.verification_cv.notify_one();
     return CAMERA_BACKEND_OK;
 }
 
