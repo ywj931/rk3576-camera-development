@@ -1,0 +1,17 @@
+common_sequences=65-75
+pairs=11
+file_size_bytes=18000000
+sequence_sets_equal=1
+both_led_detected_pairs=11
+all_pairs_led_detected=1
+timestamp_delta_ns_min=12000
+timestamp_delta_ns_max=14000
+timestamp_delta_ns_avg=12909.091
+cam0_period_ns_avg=500024900.000
+cam1_period_ns_avg=500025100.000
+cam0_core_to_background_ratio_min=1.608
+cam1_core_to_background_ratio_min=3.115
+exposure_us=1001
+gain_x1000=4000
+optical_result=PASS
+timing_scope=V4L2_ISP_EVENT_ONLY
