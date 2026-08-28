@@ -23,11 +23,13 @@ enum camera_photo_result {
     CAMERA_PHOTO_ERR_NOT_RUNNING = -404,
     CAMERA_PHOTO_ERR_MPP = -405,
     CAMERA_PHOTO_ERR_EXIF = -406,
+    CAMERA_PHOTO_ERR_QUEUE_FULL = -407,
 };
 
 typedef struct camera_photo_config {
     uint32_t width;
     uint32_t height;
+    uint32_t camera_count;
     uint32_t jpeg_quality;
     uint32_t queue_depth;
 } camera_photo_config_t;
@@ -49,6 +51,14 @@ typedef struct camera_photo_metadata {
     uint32_t exposure_us;
     uint32_t gain_x1000;
     uint32_t iso;
+    int white_balance_valid;
+    int white_balance_auto;
+    int white_balance_converged;
+    uint32_t white_balance_cct;
+    uint32_t wb_r_gain_x1000;
+    uint32_t wb_gr_gain_x1000;
+    uint32_t wb_gb_gain_x1000;
+    uint32_t wb_b_gain_x1000;
     int utc_valid;
     int trigger_monotonic_is_uart_arrival;
     int iso_estimated;

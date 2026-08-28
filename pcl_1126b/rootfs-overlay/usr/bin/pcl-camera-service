@@ -1,0 +1,101 @@
+#!/bin/sh
+set -eu
+
+CONFIG=/etc/pcl-camera.conf
+[ ! -r "$CONFIG" ] || . "$CONFIG"
+
+camera_count=${PCL_CAMERA_COUNT:-1}
+case "$camera_count" in
+	1|2) ;;
+	*) echo "invalid PCL_CAMERA_COUNT: $camera_count" >&2; exit 2 ;;
+esac
+
+find_video_node()
+{
+	wanted_name=$1
+	wanted_index=$2
+	found=0
+	for sysfs_node in /sys/class/video4linux/video*; do
+		[ -r "$sysfs_node/name" ] || continue
+		[ "$(cat "$sysfs_node/name")" = "$wanted_name" ] || continue
+		if [ "$found" -eq "$wanted_index" ]; then
+			echo "/dev/${sysfs_node##*/}"
+			return 0
+		fi
+		found=$((found + 1))
+	done
+	return 1
+}
+
+find_sensor_node()
+{
+	wanted_index=$1
+	found=0
+	for sysfs_node in /sys/class/video4linux/v4l-subdev*; do
+		[ -r "$sysfs_node/name" ] || continue
+		case "$(cat "$sysfs_node/name")" in
+			*imx586*) ;;
+			*) continue ;;
+		esac
+		if [ "$found" -eq "$wanted_index" ]; then
+			echo "/dev/${sysfs_node##*/}"
+			return 0
+		fi
+		found=$((found + 1))
+	done
+	return 1
+}
+
+resolve_video()
+{
+	configured=$1
+	name=$2
+	index=$3
+	if [ "$configured" != auto ]; then
+		echo "$configured"
+	else
+		find_video_node "$name" "$index"
+	fi
+}
+
+resolve_sensor()
+{
+	configured=$1
+	index=$2
+	if [ "$configured" != auto ]; then
+		echo "$configured"
+	else
+		find_sensor_node "$index"
+	fi
+}
+
+video0=$(resolve_video "${PCL_CAMERA_VIDEO0:-auto}" rkisp_mainpath 0)
+params0=$(resolve_video "${PCL_CAMERA_PARAMS0:-auto}" rkisp-input-params 0)
+subdev0=$(resolve_sensor "${PCL_CAMERA_SUBDEV0:-auto}" 0)
+
+set -- /usr/bin/camera_aiq_test \
+	--camera-count "$camera_count" \
+	--capture-daemon \
+	--iq0 "${PCL_CAMERA_IQ0:-/etc/iqfiles}" \
+	--video0 "$video0" \
+	--params0 "$params0" \
+	--subdev0 "$subdev0" \
+	--sensor0 imx586 \
+	--xdas-uart "${PCL_CAMERA_XDAS_UART:-/dev/ttyS2}" \
+	--xdas-save-root "${PCL_CAMERA_SAVE_ROOT:-/userdata/camera}" \
+	--xdas-version "${PCL_CAMERA_VERSION:-DASCAM-RV1126B-00.01}"
+
+if [ "$camera_count" -eq 2 ]; then
+	video1=$(resolve_video "${PCL_CAMERA_VIDEO1:-auto}" rkisp_mainpath 1)
+	params1=$(resolve_video "${PCL_CAMERA_PARAMS1:-auto}" rkisp-input-params 1)
+	subdev1=$(resolve_sensor "${PCL_CAMERA_SUBDEV1:-auto}" 1)
+	set -- "$@" \
+		--iq1 "${PCL_CAMERA_IQ1:-/etc/iqfiles}" \
+		--video1 "$video1" \
+		--params1 "$params1" \
+		--subdev1 "$subdev1" \
+		--sensor1 imx586
+fi
+
+mkdir -p "${PCL_CAMERA_SAVE_ROOT:-/userdata/camera}"
+exec "$@"

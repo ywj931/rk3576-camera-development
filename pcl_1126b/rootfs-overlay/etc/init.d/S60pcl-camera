@@ -1,0 +1,35 @@
+#!/bin/sh
+
+CONFIG=/etc/pcl-camera.conf
+[ ! -r "$CONFIG" ] || . "$CONFIG"
+PIDFILE=/var/run/pcl-camera.pid
+LOGFILE=/var/log/pcl-camera.log
+
+case "$1" in
+	start)
+		if [ "${PCL_CAMERA_AUTOSTART:-0}" != 1 ]; then
+			echo "pcl-camera autostart disabled"
+			exit 0
+		fi
+		[ ! -x /etc/init.d/S40rkaiq_3A ] || \
+			/etc/init.d/S40rkaiq_3A stop >/dev/null 2>&1 || true
+		mkdir -p /var/log
+		start-stop-daemon -S -q -b -m -p "$PIDFILE" \
+			-x /bin/sh -- -c \
+			"exec /usr/bin/pcl-camera-service >>'$LOGFILE' 2>&1"
+		;;
+	stop)
+		start-stop-daemon -K -q -p "$PIDFILE" -R TERM/10/KILL/5 || true
+		rm -f "$PIDFILE"
+		;;
+	restart)
+		"$0" stop
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0

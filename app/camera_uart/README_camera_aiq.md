@@ -10,6 +10,8 @@
 - 曝光、模拟增益、帧率、开始/停止出流、开始/停止保存和状态查询命令；
 - 一条 `/dev/ttyS9` 115200、8N1 全双工链路，统一承载相机控制、MCU XVS
   命令/应答、PPS/GPRMC/Trigger 事件；
+- 可选独立 `--xdas-uart`，提供 `AA/55 + length + cmd + CRC8/0xD5`
+  外部相机控制协议，支持查询、设时、双路或单路本机保存和 UVC；
 - PPS/GPRMC UTC 对时，以及 trigger 与双路 frame_id 绑定。
 
 UVC 将 camera0、camera1 分别输出到 `uvc.0`、`uvc.1`，依赖 USB gadget 按
@@ -126,6 +128,23 @@ UVC 和 HTTP；RNDIS Gadget 由 `usbdevice.service` 独立常驻。因此停止�
 `--control-uart`、`--sync-uart` 仅保留给旧脚本或确实有两路物理 UART 的产品。
 当前没有 MCU、只验证相机控制时仍可单独使用 `--control-uart /dev/ttyS9`；接入
 最终 MCU 后必须改用 `--uart /dev/ttyS9`。
+
+需要兼容 xdas 相机控制器时，不使用上述 ASCII 相机控制入口，改为独立串口：
+
+```sh
+./camera_aiq_test --all-daemon \
+  --xdas-uart /dev/ttyS8 --xdas-save-root /data/camera \
+  --sync-uart /dev/ttyS9 --sync-timer-hz 1000000 \
+  --xvs-autostart-hz 4
+```
+
+协议、命令完成度和保存语义见 `XDAS_CAMERA_UART_PROTOCOL.md`。外部 xdas UART
+和内部同步 MCU UART 不允许指向同一个设备。
+
+RV1126B 当前确认的保存分区是 `/userdata`，串口候选节点是 `/dev/ttyS4`、
+`/dev/ttyS5`，但物理接线尚未确认，不能直接照抄上面的 RK3576 设备号。单路 IMX586
+保存实测结果及第二路 ISP/sensor 阻塞见
+`RV1126B_XDAS_MIGRATION_STATUS_20260826.md`。
 
 ## 本地命令
 

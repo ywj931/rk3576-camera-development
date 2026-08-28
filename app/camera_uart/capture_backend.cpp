@@ -588,6 +588,7 @@ extern "C" void capture_backend_default_config(capture_backend_config_t *config)
     std::memset(config, 0, sizeof(*config));
     config->width = 4000;
     config->height = 3000;
+    config->camera_count = CAPTURE_BACKEND_CAMERA_COUNT;
     config->video_device[0] = "/dev/video22";
     config->video_device[1] = "/dev/video31";
 }
@@ -596,11 +597,13 @@ extern "C" int capture_backend_create(const capture_backend_config_t *config,
                                       capture_backend_t **backend_out)
 {
     if (config == nullptr || backend_out == nullptr || config->width == 0 ||
-        config->height == 0) {
+        config->height == 0 || config->camera_count == 0 ||
+        config->camera_count > CAPTURE_BACKEND_CAMERA_COUNT) {
         return CAPTURE_BACKEND_ERR_ARGUMENT;
     }
     *backend_out = nullptr;
-    for (int camera_id = 0; camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+    for (int camera_id = 0;
+         camera_id < static_cast<int>(config->camera_count);
          ++camera_id) {
         if (config->video_device[camera_id] == nullptr ||
             config->video_device[camera_id][0] == '\0') {
@@ -611,7 +614,8 @@ extern "C" int capture_backend_create(const capture_backend_config_t *config,
     capture_backend_t *backend = new (std::nothrow) capture_backend_t;
     if (backend == nullptr)
         return CAPTURE_BACKEND_ERR_IO;
-    for (int camera_id = 0; camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+    for (int camera_id = 0;
+         camera_id < static_cast<int>(config->camera_count);
          ++camera_id) {
         CaptureSlot &camera = backend->cameras[camera_id];
         camera.camera_id = camera_id;

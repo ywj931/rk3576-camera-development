@@ -79,6 +79,10 @@ std::string user_comment(const Metadata &metadata)
         "frame_monotonic_ns=%llu;frame_realtime_ns=%llu;"
         "exposure_start_realtime_ns=%llu;exposure_center_realtime_ns=%llu;"
         "exposure_us=%u;gain_x1000=%u;iso=%u;iso_estimated=%d;"
+        "white_balance_valid=%d;white_balance_auto=%d;"
+        "white_balance_converged=%d;white_balance_cct=%u;"
+        "wb_r_gain_x1000=%u;wb_gr_gain_x1000=%u;"
+        "wb_gb_gain_x1000=%u;wb_b_gain_x1000=%u;"
         "sensor_response_offset_ns=%lld;trigger_to_frame_ns=%lld;"
         "utc_valid=%d;trigger_monotonic_is_uart_arrival=%d;"
         "trigger_source=%s;exposure_source=%s",
@@ -94,6 +98,12 @@ std::string user_comment(const Metadata &metadata)
         static_cast<unsigned long long>(metadata.exposure_center_realtime_ns),
         metadata.exposure_us, metadata.gain_x1000, metadata.iso,
         metadata.iso_estimated ? 1 : 0,
+        metadata.white_balance_valid ? 1 : 0,
+        metadata.white_balance_auto ? 1 : 0,
+        metadata.white_balance_converged ? 1 : 0,
+        metadata.white_balance_cct, metadata.wb_r_gain_x1000,
+        metadata.wb_gr_gain_x1000, metadata.wb_gb_gain_x1000,
+        metadata.wb_b_gain_x1000,
         static_cast<long long>(metadata.sensor_response_offset_ns),
         static_cast<long long>(metadata.trigger_to_frame_ns),
         metadata.utc_valid ? 1 : 0,
@@ -127,7 +137,7 @@ int insert_exif(const std::vector<uint8_t> &jpeg, const Metadata &metadata,
         return EXIF_ERR_JPEG;
     }
 
-    const std::string software = std::string("camera_aiq_test stage7") + '\0';
+    const std::string software = std::string("DAS Camera") + '\0';
     const std::string date = datetime_original(
                                  metadata.exposure_start_realtime_ns) +
                              '\0';
@@ -160,7 +170,9 @@ int insert_exif(const std::vector<uint8_t> &jpeg, const Metadata &metadata,
     while (tiff.size() < exif_ifd_offset)
         tiff.push_back(0);
 
-    const uint32_t exif_ifd_size = 2 + 5 * 12 + 4;
+    const uint16_t exif_entry_count =
+        metadata.white_balance_valid ? 6U : 5U;
+    const uint32_t exif_ifd_size = 2 + exif_entry_count * 12 + 4;
     const uint32_t exposure_offset = exif_ifd_offset + exif_ifd_size;
     const uint32_t date_offset = exposure_offset + 8;
     const uint32_t subsec_offset =
@@ -168,7 +180,7 @@ int insert_exif(const std::vector<uint8_t> &jpeg, const Metadata &metadata,
     const uint32_t comment_offset =
         subsec_offset + checked_u32(subsec.size());
 
-    append_u16(&tiff, 5);
+    append_u16(&tiff, exif_entry_count);
     append_entry(&tiff, 0x829a, kTypeRational, 1, exposure_offset);
     append_entry(&tiff, 0x8827, kTypeShort, 1,
                  std::min<uint32_t>(metadata.iso, UINT16_MAX));
@@ -178,6 +190,10 @@ int insert_exif(const std::vector<uint8_t> &jpeg, const Metadata &metadata,
                  subsec_offset);
     append_entry(&tiff, 0x9286, kTypeUndefined,
                  checked_u32(comment.size()), comment_offset);
+    if (metadata.white_balance_valid) {
+        append_entry(&tiff, 0xa403, kTypeShort, 1,
+                     metadata.white_balance_auto ? 0U : 1U);
+    }
     append_u32(&tiff, 0);
 
     const uint32_t divisor = std::gcd(metadata.exposure_us, 1000000U);
@@ -231,6 +247,14 @@ int self_test(std::string *report)
     metadata.exposure_us = 5000;
     metadata.gain_x1000 = 2000;
     metadata.iso = 200;
+    metadata.white_balance_valid = true;
+    metadata.white_balance_auto = true;
+    metadata.white_balance_converged = true;
+    metadata.white_balance_cct = 5500;
+    metadata.wb_r_gain_x1000 = 1800;
+    metadata.wb_gr_gain_x1000 = 1000;
+    metadata.wb_gb_gain_x1000 = 1000;
+    metadata.wb_b_gain_x1000 = 1650;
     metadata.sensor_response_offset_ns = 5000;
     metadata.trigger_to_frame_ns = 12000;
     metadata.trigger_source = "SIM";
@@ -249,6 +273,9 @@ int self_test(std::string *report)
         contains_bytes(output,
                        "utc_valid=1;trigger_monotonic_is_uart_arrival=1") &&
         contains_bytes(output, "exposure_us=5000") &&
+        contains_bytes(output,
+                       "white_balance_valid=1;white_balance_auto=1") &&
+        contains_bytes(output, "white_balance_cct=5500") &&
         contains_bytes(output, "trigger_source=SIM") &&
         contains_bytes(output, "2024:03:09 16:00:00") &&
         output[output.size() - 2] == 0xff && output.back() == 0xd9;

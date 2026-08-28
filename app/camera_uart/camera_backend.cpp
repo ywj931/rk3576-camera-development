@@ -9,6 +9,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/v4l2-subdev.h>
 #include <linux/videodev2.h>
 #include <mutex>
 #include <new>
@@ -19,8 +20,11 @@
 #include <unistd.h>
 
 #include "uAPI2/rk_aiq_user_api2_ae.h"
+#include "uAPI2/rk_aiq_user_api2_awb.h"
 #include "uAPI2/rk_aiq_user_api2_imgproc.h"
 #include "uAPI2/rk_aiq_user_api2_sysctl.h"
+
+#include "imx586_v4l2_metadata.h"
 
 namespace {
 
@@ -96,6 +100,69 @@ std::string discover_sensor_device(const std::string &sensor_name)
     }
     closedir(directory);
     return result;
+}
+
+bool read_v4l2_control(int fd, uint32_t id, int64_t *value)
+{
+    if (fd < 0 || !value)
+        return false;
+    struct v4l2_ext_control control = {};
+    control.id = id;
+    struct v4l2_ext_controls controls = {};
+    controls.which = V4L2_CTRL_WHICH_CUR_VAL;
+    controls.count = 1;
+    controls.controls = &control;
+    int result;
+    do {
+        result = ioctl(fd, VIDIOC_G_EXT_CTRLS, &controls);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0)
+        return false;
+    *value = control.value64;
+    return true;
+}
+
+bool read_imx586_metadata(const CameraSlot &camera,
+                          imx586_v4l2::Metadata *metadata)
+{
+    if (!metadata || camera.sensor_device.empty())
+        return false;
+
+    const int fd = open(camera.sensor_device.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+
+    int64_t exposure = 0;
+    int64_t hblank = 0;
+    int64_t pixel_rate = 0;
+    int64_t gain = 0;
+    struct v4l2_subdev_format format = {};
+    format.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    format.pad = 0;
+    int format_result;
+    do {
+        format_result = ioctl(fd, VIDIOC_SUBDEV_G_FMT, &format);
+    } while (format_result < 0 && errno == EINTR);
+    const bool controls_ok =
+        read_v4l2_control(fd, V4L2_CID_EXPOSURE, &exposure) &&
+        read_v4l2_control(fd, V4L2_CID_HBLANK, &hblank) &&
+        read_v4l2_control(fd, V4L2_CID_PIXEL_RATE, &pixel_rate) &&
+        read_v4l2_control(fd, V4L2_CID_ANALOGUE_GAIN, &gain);
+    close(fd);
+    if (format_result < 0 || !controls_ok || exposure <= 0 || hblank < 0 ||
+        pixel_rate <= 0 || gain <= 0 ||
+        exposure > static_cast<int64_t>(UINT32_MAX) ||
+        hblank > static_cast<int64_t>(UINT32_MAX) ||
+        gain > static_cast<int64_t>(UINT32_MAX) || format.format.width == 0)
+        return false;
+
+    imx586_v4l2::ControlSnapshot snapshot;
+    snapshot.exposure_lines_x16 = static_cast<uint32_t>(exposure);
+    snapshot.active_width = format.format.width;
+    snapshot.horizontal_blanking = static_cast<uint32_t>(hblank);
+    snapshot.pixel_rate = static_cast<uint64_t>(pixel_rate);
+    snapshot.gain_code = static_cast<uint32_t>(gain);
+    return imx586_v4l2::convert_controls(snapshot, metadata);
 }
 
 int sensor_xvs_thin_ioctl(CameraSlot &camera, unsigned long request,
@@ -200,21 +267,28 @@ int initialize_manual_target(CameraSlot &camera, const char *operation)
         rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &current));
     if (result != CAMERA_BACKEND_OK)
         return result;
-    if (!valid_linear_query(current)) {
-        std::fprintf(stderr,
-                     "CAMERA_AIQ_ERROR sensor=%s operation=%s invalid_time=%f invalid_gain=%f\n",
-                     camera.sensor_name.c_str(), operation,
-                     current.linExpInfo.expParam.integration_time,
-                     current.linExpInfo.expParam.analog_gain);
-        return CAMERA_BACKEND_ERR_NOT_READY;
+    if (valid_linear_query(current)) {
+        camera.requested_exposure_us = to_u32_rounded(
+            current.linExpInfo.expParam.integration_time * 1000000.0f);
+        camera.requested_gain_x1000 = to_u32_rounded(
+            current.linExpInfo.expParam.analog_gain * 1000.0f);
+        camera.requested_iso = to_u32_rounded(
+            current.linExpInfo.expParam.analog_gain * kBaseIso);
+    } else {
+        imx586_v4l2::Metadata sensor_metadata;
+        if (!read_imx586_metadata(camera, &sensor_metadata) ||
+            sensor_metadata.gain_x1000 > kMaxGainX1000) {
+            std::fprintf(stderr,
+                         "CAMERA_AIQ_ERROR sensor=%s operation=%s invalid_time=%f invalid_gain=%f v4l2_fallback=failed\n",
+                         camera.sensor_name.c_str(), operation,
+                         current.linExpInfo.expParam.integration_time,
+                         current.linExpInfo.expParam.analog_gain);
+            return CAMERA_BACKEND_ERR_NOT_READY;
+        }
+        camera.requested_exposure_us = sensor_metadata.exposure_us;
+        camera.requested_gain_x1000 = sensor_metadata.gain_x1000;
+        camera.requested_iso = sensor_metadata.iso;
     }
-
-    camera.requested_exposure_us = to_u32_rounded(
-        current.linExpInfo.expParam.integration_time * 1000000.0f);
-    camera.requested_gain_x1000 = to_u32_rounded(
-        current.linExpInfo.expParam.analog_gain * 1000.0f);
-    camera.requested_iso = to_u32_rounded(
-        current.linExpInfo.expParam.analog_gain * kBaseIso);
     camera.manual_target_valid = true;
     camera.manual_settings_verified = false;
     return CAMERA_BACKEND_OK;
@@ -385,6 +459,7 @@ extern "C" void camera_backend_default_config(camera_backend_config_t *config)
     std::memset(config, 0, sizeof(*config));
     config->width = 4000;
     config->height = 3000;
+    config->camera_count = CAMERA_BACKEND_CAMERA_COUNT;
     config->iq_dir[0] = "/etc/iqfiles/cam0";
     config->iq_dir[1] = "/etc/iqfiles/cam1";
     config->expected_sensor[0] = "imx586";
@@ -397,12 +472,14 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
                                      camera_backend_t **backend_out)
 {
     if (config == nullptr || backend_out == nullptr || config->width == 0 ||
-        config->height == 0) {
+        config->height == 0 || config->camera_count == 0 ||
+        config->camera_count > CAMERA_BACKEND_CAMERA_COUNT) {
         return CAMERA_BACKEND_ERR_ARGUMENT;
     }
     *backend_out = nullptr;
 
-    for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
+    for (int camera_id = 0;
+         camera_id < static_cast<int>(config->camera_count);
          ++camera_id) {
         if (!directory_exists(config->iq_dir[camera_id]) ||
             config->params_device[camera_id] == nullptr ||
@@ -426,7 +503,8 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
 
     // Build both contexts before preparing either one. Rockchip's multi-camera
     // samples use the same two-phase ordering so each ISP is known up front.
-    for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
+    for (int camera_id = 0;
+         camera_id < static_cast<int>(config->camera_count);
          ++camera_id) {
         CameraSlot &camera = backend->cameras[camera_id];
         rk_aiq_static_info_t static_info = {};
@@ -488,13 +566,14 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
             break;
         }
 
-        rk_aiq_uapi2_sysctl_setMulCamConc(camera.ctx, true);
+        rk_aiq_uapi2_sysctl_setMulCamConc(camera.ctx,
+                                          config->camera_count > 1);
         rk_aiq_uapi2_sysctl_setListenStrmStatus(camera.ctx, false);
     }
 
     for (int camera_id = 0;
          result == CAMERA_BACKEND_OK &&
-         camera_id < CAMERA_BACKEND_CAMERA_COUNT;
+         camera_id < static_cast<int>(config->camera_count);
          ++camera_id) {
         CameraSlot &camera = backend->cameras[camera_id];
         XCamReturn aiq_result = rk_aiq_uapi2_sysctl_prepare(
@@ -545,15 +624,18 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
     }
 
     if (result != CAMERA_BACKEND_OK) {
-        for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
+        for (int camera_id = 0;
+             camera_id < static_cast<int>(config->camera_count);
              ++camera_id) {
             backend->cameras[camera_id].stop_event_thread.store(true);
         }
-        for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
+        for (int camera_id = 0;
+             camera_id < static_cast<int>(config->camera_count);
              ++camera_id) {
             stop_event_worker(backend->cameras[camera_id]);
         }
-        for (int camera_id = CAMERA_BACKEND_CAMERA_COUNT - 1; camera_id >= 0;
+        for (int camera_id = static_cast<int>(config->camera_count) - 1;
+             camera_id >= 0;
              --camera_id) {
             shutdown_camera(backend->cameras[camera_id]);
         }
@@ -789,7 +871,6 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
     XCamReturn query_result =
         rk_aiq_user_api2_ae_queryExpResInfo(camera.ctx, &query);
     if (query_result == XCAM_RETURN_NO_ERROR) {
-        status->query_valid = 1;
         status->converged = query.isConverged;
         status->exposure_us = to_u32_rounded(
             query.linExpInfo.expParam.integration_time * 1000000.0f);
@@ -820,19 +901,32 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
                                 ? camera.requested_fps * 1000U
                                 : to_u32_rounded(query.fps * 1000.0f);
         status->mean_luma = query.linExpInfo.meanLuma;
-        if (camera.manual_target_valid) {
-            status->manual_settings_verified =
-                within_tolerance(status->exposure_us,
-                                 camera.requested_exposure_us, 100U) &&
-                within_tolerance(status->gain_x1000,
-                                 camera.requested_gain_x1000, 50U);
-            camera.manual_settings_verified =
-                status->manual_settings_verified != 0;
-            status->manual_settings_pending =
-                !camera.manual_settings_verified;
-        }
+        status->query_valid = valid_linear_query(query) && status->iso > 0;
     } else if (camera.requested_fps != 0) {
         status->fps_x1000 = camera.requested_fps * 1000;
+    }
+
+    if (!status->query_valid) {
+        imx586_v4l2::Metadata sensor_metadata;
+        if (read_imx586_metadata(camera, &sensor_metadata)) {
+            status->query_valid = 1;
+            status->sensor_controls_valid = 1;
+            status->exposure_us = sensor_metadata.exposure_us;
+            status->gain_x1000 = sensor_metadata.gain_x1000;
+            status->iso = static_cast<int>(sensor_metadata.iso);
+            status->iso_estimated = 1;
+        }
+    }
+
+    if (camera.manual_target_valid && status->query_valid) {
+        status->manual_settings_verified =
+            within_tolerance(status->exposure_us,
+                             camera.requested_exposure_us, 100U) &&
+            within_tolerance(status->gain_x1000,
+                             camera.requested_gain_x1000, 50U);
+        camera.manual_settings_verified =
+            status->manual_settings_verified != 0;
+        status->manual_settings_pending = !camera.manual_settings_verified;
     }
 
     if (query_result != XCAM_RETURN_NO_ERROR)
@@ -841,6 +935,25 @@ extern "C" int camera_backend_get_status(camera_backend_t *backend,
         status->last_aiq_error = static_cast<int>(mode_result);
     else
         status->last_aiq_error = 0;
+
+    rk_aiq_wb_querry_info_t white_balance = {};
+    if (rk_aiq_user_api2_awb_QueryWBInfo(camera.ctx, &white_balance) ==
+        XCAM_RETURN_NO_ERROR) {
+        status->white_balance_valid = 1;
+        status->white_balance_auto =
+            white_balance.opMode == RK_AIQ_OP_MODE_AUTO;
+        status->white_balance_converged = white_balance.awbConverged;
+        status->white_balance_cct =
+            to_u32_rounded(white_balance.cctGloabl.CCT);
+        status->wb_r_gain_x1000 =
+            to_u32_rounded(white_balance.gain.rgain * 1000.0f);
+        status->wb_gr_gain_x1000 =
+            to_u32_rounded(white_balance.gain.grgain * 1000.0f);
+        status->wb_gb_gain_x1000 =
+            to_u32_rounded(white_balance.gain.gbgain * 1000.0f);
+        status->wb_b_gain_x1000 =
+            to_u32_rounded(white_balance.gain.bgain * 1000.0f);
+    }
 
     return CAMERA_BACKEND_OK;
 }

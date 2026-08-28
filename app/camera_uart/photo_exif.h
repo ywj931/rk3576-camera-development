@@ -24,6 +24,14 @@ struct Metadata {
     uint32_t exposure_us = 0;
     uint32_t gain_x1000 = 0;
     uint32_t iso = 0;
+    bool white_balance_valid = false;
+    bool white_balance_auto = false;
+    bool white_balance_converged = false;
+    uint32_t white_balance_cct = 0;
+    uint32_t wb_r_gain_x1000 = 0;
+    uint32_t wb_gr_gain_x1000 = 0;
+    uint32_t wb_gb_gain_x1000 = 0;
+    uint32_t wb_b_gain_x1000 = 0;
     bool utc_valid = false;
     bool trigger_monotonic_is_uart_arrival = false;
     bool iso_estimated = false;

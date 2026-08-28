@@ -27,6 +27,7 @@ enum camera_backend_result {
 typedef struct camera_backend_config {
     uint32_t width;
     uint32_t height;
+    uint32_t camera_count;
     const char *iq_dir[CAMERA_BACKEND_CAMERA_COUNT];
     const char *expected_sensor[CAMERA_BACKEND_CAMERA_COUNT];
     const char *params_device[CAMERA_BACKEND_CAMERA_COUNT];
@@ -40,6 +41,7 @@ typedef struct camera_backend_status {
     int started;
     int manual_mode;
     int query_valid;
+    int sensor_controls_valid;
     int converged;
     int iso;
     int aiq_iso;
@@ -56,6 +58,14 @@ typedef struct camera_backend_status {
     uint32_t requested_gain_x1000;
     uint32_t requested_iso;
     uint32_t requested_fps_x1000;
+    int white_balance_valid;
+    int white_balance_auto;
+    int white_balance_converged;
+    uint32_t white_balance_cct;
+    uint32_t wb_r_gain_x1000;
+    uint32_t wb_gr_gain_x1000;
+    uint32_t wb_gb_gain_x1000;
+    uint32_t wb_b_gain_x1000;
     int xvs_config_valid;
     uint32_t xvs_input_thin;
     float mean_luma;

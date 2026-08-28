@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * PCL RV1126B camera board U-Boot device tree.
+ * Early boot uses eMMC only; the Linux device tree owns board peripherals.
+ */
+
+/dts-v1/;
+#include "rv1126b.dtsi"
+#include "rv1126b-u-boot.dtsi"
+
+/ {
+	model = "PCL RV1126B Dual IMX586 Camera V1";
+	compatible = "pcl,rv1126b-camera-v1", "rockchip,rv1126b";
+};
+
+&emmc {
+	/delete-property/ mmc-hs200-1_8v;
+	max-frequency = <50000000>;
+	cap-mmc-highspeed;
+};

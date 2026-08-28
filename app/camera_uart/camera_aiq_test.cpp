@@ -8,6 +8,8 @@
 #include "time_sync_service.h"
 #include "trigger_frame_binder.h"
 #include "trigger_simulator.h"
+#include "xdas_camera_protocol.h"
+#include "xdas_camera_service.h"
 #include "xvs_uart_controller.h"
 
 #include <algorithm>
@@ -19,10 +21,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <sys/statvfs.h>
 #include <thread>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
@@ -95,12 +100,56 @@ bool parse_camera_id(const std::string &text, int *camera_id)
     return true;
 }
 
+bool filesystem_capacity_mb(std::string path, uint32_t *free_mb,
+                            uint32_t *total_mb)
+{
+    if (path.empty() || path[0] != '/' || !free_mb || !total_mb)
+        return false;
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+
+    struct statvfs information = {};
+    while (statvfs(path.c_str(), &information) < 0) {
+        if ((errno != ENOENT && errno != ENOTDIR) || path == "/")
+            return false;
+        const size_t separator = path.find_last_of('/');
+        path = separator == 0 ? "/" : path.substr(0, separator);
+    }
+
+    const uint64_t block_size = information.f_frsize
+                                    ? static_cast<uint64_t>(information.f_frsize)
+                                    : static_cast<uint64_t>(information.f_bsize);
+    const auto blocks_to_mb = [block_size](uint64_t blocks) {
+        const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+        const uint64_t bytes =
+            block_size && blocks > maximum / block_size
+                ? maximum
+                : blocks * block_size;
+        return static_cast<uint32_t>(std::min<uint64_t>(
+            bytes / (1024ULL * 1024ULL),
+            std::numeric_limits<uint32_t>::max()));
+    };
+    *free_mb = blocks_to_mb(static_cast<uint64_t>(information.f_bavail));
+    *total_mb = blocks_to_mb(static_cast<uint64_t>(information.f_blocks));
+    return true;
+}
+
+uint64_t realtime_us()
+{
+    struct timespec now = {};
+    if (clock_gettime(CLOCK_REALTIME, &now) < 0)
+        return 0;
+    return static_cast<uint64_t>(now.tv_sec) * 1000000ULL +
+           static_cast<uint64_t>(now.tv_nsec) / 1000ULL;
+}
+
 void print_usage(const char *program)
 {
     std::cout
         << "Usage: " << program << " [options]\n"
         << "  --width PIXELS      sensor width (default: 4000)\n"
         << "  --height PIXELS     sensor height (default: 3000)\n"
+        << "  --camera-count 1|2  active camera count (default: 2)\n"
         << "  --iq0 DIRECTORY     camera 0 IQ directory\n"
         << "  --iq1 DIRECTORY     camera 1 IQ directory\n"
         << "  --params0 DEVICE    camera 0 rkisp-input-params node\n"
@@ -113,11 +162,16 @@ void print_usage(const char *program)
         << "  --sensor1 TEXT      expected camera 1 sensor text\n"
         << "  --autostart         start capture and HTTP output for both cameras\n"
         << "  --daemon            autostart both cameras and run without console input\n"
+        << "  --capture-daemon    start capture only and run without console input\n"
         << "  --uvc-daemon        start both cameras and two UVC outputs without console input\n"
         << "  --all-daemon        start capture, HTTP and two UVC outputs without console input\n"
         << "  --uart DEVICE      unified camera control, XVS and time-event UART (recommended)\n"
         << "  --control-uart DEVICE  legacy separate camera control UART\n"
         << "  --control-uart-protocol-self-test  test control protocol without hardware\n"
+        << "  --xdas-uart DEVICE  xdas-compatible external camera control UART\n"
+        << "  --xdas-save-root DIR  JPEG/EXIF save root (default: /data/camera)\n"
+        << "  --xdas-version TEXT  version returned by xdas command 00 00\n"
+        << "  --xdas-protocol-self-test  test xdas framing and command mapping\n"
         << "  --sync-uart DEVICE  legacy separate MCU XVS/time-event UART\n"
         << "  --sync-timer-hz HZ  MCU high-resolution timer frequency (default: 1000000)\n"
         << "  --xvs-autostart-hz 4  start the shared 4 Hz XVS timebase after capture starts\n"
@@ -191,6 +245,7 @@ void print_status(camera_backend_t *backend, int camera_id)
               << " started=" << status.started
               << " mode=" << (status.manual_mode ? "MANUAL" : "AUTO")
               << " query_valid=" << status.query_valid
+              << " sensor_controls_valid=" << status.sensor_controls_valid
               << " exposure_us=" << status.exposure_us
               << " gain_x1000=" << status.gain_x1000
               << " digital_gain_x1000=" << status.digital_gain_x1000
@@ -198,6 +253,15 @@ void print_status(camera_backend_t *backend, int camera_id)
               << " iso=" << status.iso
               << " aiq_iso=" << status.aiq_iso
               << " iso_estimated=" << status.iso_estimated
+              << " white_balance_valid=" << status.white_balance_valid
+              << " white_balance_auto=" << status.white_balance_auto
+              << " white_balance_converged="
+              << status.white_balance_converged
+              << " white_balance_cct=" << status.white_balance_cct
+              << " wb_r_gain_x1000=" << status.wb_r_gain_x1000
+              << " wb_gr_gain_x1000=" << status.wb_gr_gain_x1000
+              << " wb_gb_gain_x1000=" << status.wb_gb_gain_x1000
+              << " wb_b_gain_x1000=" << status.wb_b_gain_x1000
               << " fps_x1000=" << status.fps_x1000
               << " requested_exposure_us="
               << status.requested_exposure_us
@@ -758,6 +822,7 @@ struct output_backends {
     camera_uvc_backend_t *uvc = nullptr;
     camera_net_backend_t *net = nullptr;
     camera_backend_t *camera = nullptr;
+    capture_backend_t *capture = nullptr;
     trigger_frame_binder_t *binder = nullptr;
     camera_photo_backend_t *photo = nullptr;
 };
@@ -776,15 +841,23 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
                                plane1, plane1_size, sequence);
     }
     if (!outputs->photo || !outputs->binder || !outputs->camera ||
+        !outputs->capture ||
         !camera_photo_is_enabled(outputs->photo, camera_id))
         return;
 
     trigger_frame_match_t match = {};
     const int match_result = trigger_frame_binder_find_frame(
         outputs->binder, camera_id, sequence, &match);
-    if (match_result != TRIGGER_FRAME_BINDER_OK || !match.valid) {
+    const bool trigger_bound =
+        match_result == TRIGGER_FRAME_BINDER_OK && match.valid;
+    capture_backend_status_t capture_status = {};
+    if (!trigger_bound) {
         camera_photo_note_unbound_frame(outputs->photo, camera_id);
-        return;
+        if (capture_backend_get_status(outputs->capture, camera_id,
+                                       &capture_status) != CAPTURE_BACKEND_OK ||
+            !capture_status.timestamp_valid ||
+            capture_status.last_sequence != sequence)
+            return;
     }
 
     camera_backend_status_t camera_status = {};
@@ -793,40 +866,71 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
     camera_photo_metadata_t metadata = {};
     metadata.camera_id = camera_id;
     metadata.frame_id = sequence;
-    metadata.trigger_id = match.trigger_id;
-    metadata.trigger_monotonic_ns = match.trigger_monotonic_ns;
-    metadata.trigger_realtime_ns = match.trigger_realtime_ns;
-    metadata.pps_id = match.pps_id;
-    metadata.trigger_timer_tick = match.trigger_timer_tick;
-    metadata.frame_monotonic_ns = match.v4l2_timestamp_ns;
-    metadata.frame_realtime_ns = match.realtime_dequeue_ns;
-    metadata.trigger_to_frame_ns = match.trigger_to_frame_ns;
+    metadata.trigger_id = trigger_bound ? match.trigger_id : 0;
+    metadata.trigger_monotonic_ns =
+        trigger_bound ? match.trigger_monotonic_ns : 0;
+    metadata.trigger_realtime_ns =
+        trigger_bound ? match.trigger_realtime_ns : 0;
+    metadata.pps_id = trigger_bound ? match.pps_id : 0;
+    metadata.trigger_timer_tick =
+        trigger_bound ? match.trigger_timer_tick : 0;
+    metadata.frame_monotonic_ns = trigger_bound
+                                      ? match.v4l2_timestamp_ns
+                                      : capture_status.last_v4l2_timestamp_ns;
+    metadata.frame_realtime_ns = trigger_bound
+                                     ? match.realtime_dequeue_ns
+                                     : capture_status.last_realtime_dequeue_ns;
+    metadata.trigger_to_frame_ns =
+        trigger_bound ? match.trigger_to_frame_ns : 0;
     camera_photo_get_response_offset(outputs->photo, camera_id,
                                      &metadata.sensor_response_offset_ns);
-    metadata.exposure_start_realtime_ns = add_signed_ns(
-        metadata.trigger_realtime_ns, metadata.sensor_response_offset_ns);
     if (status_result == CAMERA_BACKEND_OK && camera_status.query_valid) {
         metadata.exposure_us = camera_status.exposure_us;
         metadata.gain_x1000 = camera_status.gain_x1000;
         metadata.iso =
             std::max<uint32_t>(1, static_cast<uint32_t>(camera_status.iso));
         metadata.iso_estimated = camera_status.iso_estimated;
+        metadata.white_balance_valid = camera_status.white_balance_valid;
+        metadata.white_balance_auto = camera_status.white_balance_auto;
+        metadata.white_balance_converged =
+            camera_status.white_balance_converged;
+        metadata.white_balance_cct = camera_status.white_balance_cct;
+        metadata.wb_r_gain_x1000 = camera_status.wb_r_gain_x1000;
+        metadata.wb_gr_gain_x1000 = camera_status.wb_gr_gain_x1000;
+        metadata.wb_gb_gain_x1000 = camera_status.wb_gb_gain_x1000;
+        metadata.wb_b_gain_x1000 = camera_status.wb_b_gain_x1000;
+    }
+    if (trigger_bound) {
+        metadata.exposure_start_realtime_ns = add_signed_ns(
+            metadata.trigger_realtime_ns, metadata.sensor_response_offset_ns);
+    } else {
+        const uint64_t exposure_ns =
+            static_cast<uint64_t>(metadata.exposure_us) * 1000ULL;
+        metadata.exposure_start_realtime_ns =
+            metadata.frame_realtime_ns > exposure_ns
+                ? metadata.frame_realtime_ns - exposure_ns
+                : metadata.frame_realtime_ns;
     }
     metadata.exposure_center_realtime_ns =
         metadata.exposure_start_realtime_ns +
         static_cast<uint64_t>(metadata.exposure_us) * 500ULL;
-    metadata.utc_valid = match.utc_valid;
+    metadata.utc_valid = trigger_bound ? match.utc_valid : 0;
     metadata.trigger_monotonic_is_uart_arrival =
-        match.monotonic_is_uart_arrival;
+        trigger_bound ? match.monotonic_is_uart_arrival : 0;
     std::snprintf(metadata.trigger_source,
-                  sizeof(metadata.trigger_source), "%s", match.source);
+                  sizeof(metadata.trigger_source), "%s",
+                  trigger_bound ? match.source : "UNBOUND");
     std::snprintf(metadata.exposure_source,
                   sizeof(metadata.exposure_source), "%s",
                   status_result == CAMERA_BACKEND_OK &&
                           camera_status.query_valid
-                      ? (camera_status.manual_settings_verified
-                             ? "MANUAL_VERIFIED_AT_DQBUF"
-                             : "RKAIQ_QUERY_AT_DQBUF")
+                      ? (camera_status.sensor_controls_valid
+                             ? "IMX586_V4L2_DQBUF_ESTIMATE"
+                             : (trigger_bound
+                                    ? (camera_status.manual_settings_verified
+                                           ? "MANUAL_VERIFIED_AT_DQBUF"
+                                           : "RKAIQ_QUERY_AT_DQBUF")
+                                    : "RKAIQ_DQBUF_TIME_ESTIMATE"))
                       : "UNAVAILABLE");
     camera_photo_submit_nv12(outputs->photo, camera_id, plane0, plane0_size,
                              plane1, plane1_size, &metadata);
@@ -1948,6 +2052,24 @@ int process_unified_uart_control(const char *request, char *response,
     return XVS_UART_OK;
 }
 
+bool autostart_capture_only(capture_backend_t *capture, uint32_t camera_count)
+{
+    int started = 0;
+    for (; started < static_cast<int>(camera_count); ++started) {
+        const int result = capture_backend_start_stream(capture, started);
+        if (result == CAPTURE_BACKEND_OK)
+            continue;
+        std::cerr << "CAPTURE_AUTOSTART_FAILED camera_id=" << started
+                  << " code=" << result << " reason=\""
+                  << capture_backend_strerror(result) << "\"\n";
+        for (int camera_id = 0; camera_id < started; ++camera_id)
+            capture_backend_stop_stream(capture, camera_id);
+        return false;
+    }
+    std::cout << "CAPTURE_AUTOSTART_READY cameras=" << camera_count << '\n';
+    return true;
+}
+
 bool autostart_http_outputs(capture_backend_t *capture,
                             camera_net_backend_t *net)
 {
@@ -2139,7 +2261,9 @@ int main(int argc, char **argv)
     std::string params_devices[CAMERA_BACKEND_CAMERA_COUNT];
     std::string sensor_devices[CAMERA_BACKEND_CAMERA_COUNT];
     std::string video_devices[CAPTURE_BACKEND_CAMERA_COUNT];
+    uint32_t camera_count = CAMERA_BACKEND_CAMERA_COUNT;
     bool autostart = false;
+    bool capture_autostart = false;
     bool uvc_autostart = false;
     bool all_outputs_autostart = false;
     bool daemon_mode = false;
@@ -2147,11 +2271,14 @@ int main(int argc, char **argv)
     bool sync_bind_self_test = false;
     bool photo_exif_self_test = false;
     bool control_uart_protocol_self_test = false;
+    bool xdas_protocol_self_test = false;
     uint32_t xvs_autostart_hz = 0;
     uint32_t xvs_low_pulse_us = 10;
     std::string unified_uart_device;
     std::string sync_uart_device;
     std::string control_uart_device;
+    std::string xdas_uart_device;
+    xdas_camera_service::config xdas_service_config;
 
     for (int index = 1; index < argc; ++index) {
         std::string option = argv[index];
@@ -2166,6 +2293,11 @@ int main(int argc, char **argv)
         }
         if (option == "--daemon") {
             autostart = true;
+            daemon_mode = true;
+            continue;
+        }
+        if (option == "--capture-daemon") {
+            capture_autostart = true;
             daemon_mode = true;
             continue;
         }
@@ -2195,6 +2327,10 @@ int main(int argc, char **argv)
             control_uart_protocol_self_test = true;
             continue;
         }
+        if (option == "--xdas-protocol-self-test") {
+            xdas_protocol_self_test = true;
+            continue;
+        }
         if (index + 1 >= argc) {
             std::cerr << "Missing value for " << option << '\n';
             print_usage(argv[0]);
@@ -2202,7 +2338,13 @@ int main(int argc, char **argv)
         }
 
         std::string value = argv[++index];
-        if (option == "--width") {
+        if (option == "--camera-count") {
+            if (!parse_u32(value, &camera_count) || camera_count == 0 ||
+                camera_count > CAMERA_BACKEND_CAMERA_COUNT) {
+                std::cerr << "Invalid camera count: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--width") {
             if (!parse_u32(value, &config.width) || config.width == 0) {
                 std::cerr << "Invalid width: " << value << '\n';
                 return EXIT_FAILURE;
@@ -2262,12 +2404,23 @@ int main(int argc, char **argv)
             }
         } else if (option == "--control-uart") {
             control_uart_device = value;
+        } else if (option == "--xdas-uart") {
+            xdas_uart_device = value;
+        } else if (option == "--xdas-save-root") {
+            xdas_service_config.save_root = value;
+        } else if (option == "--xdas-version") {
+            xdas_service_config.version = value;
         } else {
             std::cerr << "Unknown option: " << option << '\n';
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
     }
+
+    config.camera_count = camera_count;
+    capture_config.camera_count = camera_count;
+    xdas_service_config.camera_count =
+        static_cast<std::uint8_t>(camera_count);
 
     if (!unified_uart_device.empty()) {
         if ((!sync_uart_device.empty() &&
@@ -2283,6 +2436,29 @@ int main(int argc, char **argv)
     }
     const bool shared_uart = !sync_uart_device.empty() &&
                              sync_uart_device == control_uart_device;
+    if (!xdas_uart_device.empty() && !control_uart_device.empty()) {
+        std::cerr << "UART_CONFIGURATION_FAILED reason=\"--xdas-uart cannot "
+                     "be combined with --uart or --control-uart\"\n";
+        return EXIT_FAILURE;
+    }
+    if (!xdas_uart_device.empty() &&
+        xdas_uart_device == sync_uart_device) {
+        std::cerr << "UART_CONFIGURATION_FAILED reason=\"xdas camera control "
+                     "and MCU sync require different UART devices\"\n";
+        return EXIT_FAILURE;
+    }
+    if (xdas_service_config.save_root.empty() ||
+        xdas_service_config.save_root[0] != '/') {
+        std::cerr << "XDAS_CONFIGURATION_FAILED reason=\"--xdas-save-root "
+                     "must be an absolute path\"\n";
+        return EXIT_FAILURE;
+    }
+    if (xdas_service_config.version.empty() ||
+        xdas_service_config.version.size() > 200U) {
+        std::cerr << "XDAS_CONFIGURATION_FAILED reason=\"--xdas-version must "
+                     "contain 1 to 200 bytes\"\n";
+        return EXIT_FAILURE;
+    }
     if (xvs_autostart_hz && sync_uart_device.empty()) {
         std::cerr << "XVS_AUTOSTART_CONFIGURATION_FAILED reason=\""
                      "--xvs-autostart-hz requires --uart or --sync-uart\"\n";
@@ -2332,6 +2508,21 @@ int main(int argc, char **argv)
         }
         std::cout << "CONTROL_UART_PROTOCOL_SELF_TEST_OK detail=\""
                   << report << "\"\n";
+        return EXIT_SUCCESS;
+    }
+    if (xdas_protocol_self_test) {
+        std::string protocol_report;
+        int uart_result =
+            xdas_camera_protocol::protocol_self_test(&protocol_report);
+        if (uart_result == xdas_camera_protocol::OK)
+            uart_result = xdas_camera_service::self_test(&protocol_report);
+        if (uart_result != xdas_camera_protocol::OK) {
+            std::cerr << "XDAS_PROTOCOL_SELF_TEST_FAILED code=" << uart_result
+                      << " reason=\"" << protocol_report << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "XDAS_PROTOCOL_SELF_TEST_OK detail=\""
+                  << protocol_report << "\"\n";
         return EXIT_SUCCESS;
     }
 
@@ -2389,6 +2580,7 @@ int main(int argc, char **argv)
     camera_photo_default_config(&photo_config);
     photo_config.width = config.width;
     photo_config.height = config.height;
+    photo_config.camera_count = camera_count;
     camera_photo_backend_t *photo = nullptr;
     result = camera_photo_create(&photo_config, &photo);
     if (result != CAMERA_PHOTO_OK) {
@@ -2401,16 +2593,16 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    output_backends outputs = {uvc, net, backend, nullptr, photo};
+    output_backends outputs = {uvc, net, backend, capture, nullptr, photo};
     int callback_camera_id = 0;
-    for (; callback_camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+    for (; callback_camera_id < static_cast<int>(camera_count);
          ++callback_camera_id) {
         result = capture_backend_set_frame_callback(
             capture, callback_camera_id, capture_to_outputs, &outputs);
         if (result != CAPTURE_BACKEND_OK)
             break;
     }
-    if (callback_camera_id != CAPTURE_BACKEND_CAMERA_COUNT) {
+    if (callback_camera_id != static_cast<int>(camera_count)) {
         std::cerr << "OUTPUT_CAPTURE_CALLBACK_FAILED camera_id="
                   << callback_camera_id << " code=" << result
                   << " reason=\"" << capture_backend_strerror(result)
@@ -2472,7 +2664,7 @@ int main(int argc, char **argv)
     outputs.binder = binder;
 
     int event_callback_camera_id = 0;
-    for (; event_callback_camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+    for (; event_callback_camera_id < static_cast<int>(camera_count);
          ++event_callback_camera_id) {
         result = capture_backend_set_frame_event_callback(
             capture, event_callback_camera_id, capture_to_trigger_binder,
@@ -2480,7 +2672,7 @@ int main(int argc, char **argv)
         if (result != CAPTURE_BACKEND_OK)
             break;
     }
-    if (event_callback_camera_id != CAPTURE_BACKEND_CAMERA_COUNT) {
+    if (event_callback_camera_id != static_cast<int>(camera_count)) {
         std::cerr << "TRIGGER_CAPTURE_CALLBACK_FAILED camera_id="
                   << event_callback_camera_id << " code=" << result
                   << " reason=\"" << capture_backend_strerror(result)
@@ -2549,12 +2741,26 @@ int main(int argc, char **argv)
         }
     }
 
-    std::cout << "CAMERA_BACKEND_READY cameras=" << CAMERA_BACKEND_CAMERA_COUNT
+    std::cout << "CAMERA_BACKEND_READY cameras=" << camera_count
               << " uvc=cam0,cam1:4000x3000@2-or-4fps/MJPEG"
               << " net=4000x3000/MJPEG source_rate=per-camera:2-or-4fps"
               << " HTTP=:8080/{cam0,cam1} sources=camera0,camera1\n";
     if (!daemon_mode)
         print_commands();
+
+    if (capture_autostart &&
+        !autostart_capture_only(capture, camera_count)) {
+        xvs_uart_destroy(xvs);
+        trigger_simulator_destroy(simulator);
+        time_sync_destroy(time_sync);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
 
     if (all_outputs_autostart &&
         !autostart_all_outputs(capture, net, uvc, xvs, xvs_autostart_hz,
@@ -2614,7 +2820,106 @@ int main(int argc, char **argv)
                 break;
         }
     };
-    if (shared_uart) {
+
+    xdas_camera_service::operations xdas_operations;
+    xdas_operations.capture_running = [&](uint8_t camera_id) {
+        capture_backend_status_t status = {};
+        return capture_backend_get_status(capture, camera_id, &status) ==
+                   CAPTURE_BACKEND_OK &&
+               status.running;
+    };
+    xdas_operations.save_enabled = [&](uint8_t camera_id) {
+        return camera_photo_is_enabled(photo, camera_id) != 0;
+    };
+    xdas_operations.save_session_error = [&](uint8_t camera_id) -> int {
+        camera_photo_status_t status = {};
+        if (camera_photo_get_status(photo, camera_id, &status) !=
+            CAMERA_PHOTO_OK)
+            return CAMERA_PHOTO_ERR_ARGUMENT;
+        return status.last_error;
+    };
+    xdas_operations.start_save =
+        [&](uint8_t camera_id, const std::string &path) {
+            return camera_photo_start(photo, camera_id, path.c_str());
+        };
+    xdas_operations.stop_save = [&](uint8_t camera_id) {
+        return camera_photo_stop(photo, camera_id);
+    };
+    xdas_operations.start_uvc = [&](int target) -> int {
+        const int first = target == xdas_camera_service::kAllCameras ? 0 : target;
+        const int count = target == xdas_camera_service::kAllCameras
+                              ? static_cast<int>(camera_count)
+                              : 1;
+        for (int offset = 0; offset < count; ++offset) {
+            capture_backend_status_t status = {};
+            if (capture_backend_get_status(capture, first + offset, &status) !=
+                    CAPTURE_BACKEND_OK ||
+                !status.running)
+                return CAMERA_UVC_ERR_STATE;
+        }
+        return target == xdas_camera_service::kAllCameras
+                   ? camera_uvc_start_all(uvc)
+                   : camera_uvc_start(uvc, target);
+    };
+    xdas_operations.capacity_mb = [&](uint32_t *free_mb,
+                                      uint32_t *total_mb) {
+        return filesystem_capacity_mb(xdas_service_config.save_root, free_mb,
+                                      total_mb);
+    };
+    xdas_operations.realtime_us = realtime_us;
+    xdas_operations.set_realtime_us = [&](uint64_t timestamp_us) {
+        for (int camera_id = 0; camera_id < static_cast<int>(camera_count);
+             ++camera_id) {
+            if (camera_photo_is_enabled(photo, camera_id))
+                return -1;
+        }
+        struct timespec value = {};
+        const uint64_t seconds = timestamp_us / 1000000ULL;
+        value.tv_sec = static_cast<time_t>(seconds);
+        if (value.tv_sec < 0 || static_cast<uint64_t>(value.tv_sec) != seconds)
+            return -1;
+        value.tv_nsec = static_cast<long>((timestamp_us % 1000000ULL) * 1000ULL);
+        return clock_settime(CLOCK_REALTIME, &value);
+    };
+    const auto xdas_handler =
+        [&](const xdas_camera_protocol::request &request,
+            xdas_camera_protocol::reply *reply) {
+            std::lock_guard<std::mutex> lock(unified_control.command_mutex);
+            xdas_camera_service::handle_command(
+                request, reply, xdas_service_config, xdas_operations);
+            std::ostringstream message;
+            if (reply->error == xdas_camera_protocol::ERROR_NONE) {
+                message << "XDAS_COMMAND_OK cmd0=0x" << std::hex
+                        << static_cast<unsigned int>(request.command0)
+                        << " cmd1=0x"
+                        << static_cast<unsigned int>(request.command1);
+                std::cout << message.str() << '\n';
+            } else {
+                message << "XDAS_COMMAND_ERROR cmd0=0x" << std::hex
+                        << static_cast<unsigned int>(request.command0)
+                        << " cmd1=0x"
+                        << static_cast<unsigned int>(request.command1)
+                        << " error=0x"
+                        << static_cast<unsigned int>(reply->error);
+                std::cerr << message.str() << '\n';
+            }
+        };
+
+    if (!xdas_uart_device.empty()) {
+        std::cout << "XDAS_UART_READY device=\"" << xdas_uart_device
+                  << "\" baud=115200 format=8N1 protocol=XDAS_CAMERA_V2"
+                  << " save_root=\"" << xdas_service_config.save_root
+                  << "\"\n";
+        const int uart_result = xdas_camera_protocol::run(
+            xdas_uart_device, xdas_handler, [] { return g_stop != 0; });
+        if (uart_result != xdas_camera_protocol::OK && !g_stop) {
+            std::cerr << "XDAS_UART_FAILED device=\"" << xdas_uart_device
+                      << "\" code=" << uart_result << " reason=\""
+                      << xdas_camera_protocol::strerror(uart_result)
+                      << "\"\n";
+            runtime_result = EXIT_FAILURE;
+        }
+    } else if (shared_uart) {
         std::cout << "CONTROL_UART_READY device=\"" << control_uart_device
                   << "\" baud=115200 format=8N1 protocol=CAM_V1"
                   << " owner=UART_MUX\n";

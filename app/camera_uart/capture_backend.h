@@ -38,6 +38,7 @@ enum capture_backend_result {
 typedef struct capture_backend_config {
     uint32_t width;
     uint32_t height;
+    uint32_t camera_count;
     const char *video_device[CAPTURE_BACKEND_CAMERA_COUNT];
 } capture_backend_config_t;
 

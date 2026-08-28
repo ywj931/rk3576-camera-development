@@ -10,7 +10,10 @@ APP_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SDK_ROOT := $(abspath $(APP_DIR)/../..)
 RKAIQ_ROOT ?= /usr
 MPP_ROOT ?= $(RKAIQ_ROOT)
-UVC_ROOT := $(SDK_ROOT)/external/uvc_app/uvc
+UVC_ROOT ?= $(SDK_ROOT)/external/uvc_app/uvc
+ifeq ($(wildcard $(UVC_ROOT)/uvc-gadget.c),)
+UVC_ROOT := $(SDK_ROOT)/app/camera_uart/uvc
+endif
 
 CPPFLAGS += -DUSE_NEWSTRUCT=1 -isystem $(RKAIQ_ROOT)/include/rkaiq
 CPPFLAGS += -I$(UVC_ROOT) -isystem $(MPP_ROOT)/include/rockchip
@@ -33,18 +36,30 @@ UVC_OBJECTS := rkuvc_gadget.o rkuvc_video.o rkuvc_yuv.o \
 	rkuvc_control.o rkuvc_encode.o rkuvc_uevent.o
 OBJECTS := camera_aiq_test.o camera_backend.o capture_backend.o \
 	camera_uvc_backend.o camera_net_backend.o camera_photo_backend.o \
-	photo_exif.o camera_control_uart.o xvs_uart_controller.o \
+	photo_exif.o imx586_v4l2_metadata.o camera_control_uart.o \
+	xvs_uart_controller.o \
 	trigger_frame_binder.o trigger_simulator.o time_sync_service.o \
+	xdas_camera_protocol.o xdas_camera_service.o \
 	$(UVC_OBJECTS)
 
+RV1126B_BUILDROOT := $(SDK_ROOT)/buildroot/output/alientek_rv1126b
+ifneq ($(wildcard $(RV1126B_BUILDROOT)/host/bin/aarch64-buildroot-linux-gnu-g++),)
+CROSS_CC := $(RV1126B_BUILDROOT)/host/bin/aarch64-buildroot-linux-gnu-gcc
+CROSS_CXX := $(RV1126B_BUILDROOT)/host/bin/aarch64-buildroot-linux-gnu-g++
+CROSS_SYSROOT := $(RV1126B_BUILDROOT)/host/aarch64-buildroot-linux-gnu/sysroot
+CROSS_RKAIQ_ROOT := $(CROSS_SYSROOT)/usr
+CROSS_LIBC_LIB := $(CROSS_SYSROOT)/lib
+else
 CROSS_CC := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc
 CROSS_CXX := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++
 CROSS_RKAIQ_ROOT := $(SDK_ROOT)/ubuntu/binary/usr
 CROSS_LIBC_LIB := $(SDK_ROOT)/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu/libc/lib64
+endif
 
-.PHONY: all aarch64 check check-control-uart-host check-xvs-uart \
-	check-time-sync check-stage7-host \
-	check-stage6-host clean
+.PHONY: all aarch64 aarch64-package check check-control-uart-host check-xvs-uart \
+	check-time-sync check-stage7-host check-xdas-uart \
+	check-xdas-save-rockchip check-stage6-host check-camera-transfer \
+	check-imx586-v4l2-metadata clean
 
 all: $(TARGETS)
 
@@ -54,10 +69,14 @@ camera_aiq_test: $(OBJECTS)
 camera_aiq_test.o: camera_aiq_test.cpp camera_backend.h capture_backend.h \
 	camera_uvc_backend.h camera_net_backend.h xvs_uart_controller.h \
 	camera_photo_backend.h camera_control_uart.h photo_exif.h \
-	trigger_frame_binder.h trigger_simulator.h time_sync_service.h
+	trigger_frame_binder.h trigger_simulator.h time_sync_service.h \
+	xdas_camera_protocol.h xdas_camera_service.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-camera_backend.o: camera_backend.cpp camera_backend.h
+camera_backend.o: camera_backend.cpp camera_backend.h imx586_v4l2_metadata.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+imx586_v4l2_metadata.o: imx586_v4l2_metadata.cpp imx586_v4l2_metadata.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 capture_backend.o: capture_backend.cpp capture_backend.h
@@ -90,6 +109,13 @@ trigger_simulator.o: trigger_simulator.cpp trigger_simulator.h
 time_sync_service.o: time_sync_service.cpp time_sync_service.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
+xdas_camera_protocol.o: xdas_camera_protocol.cpp xdas_camera_protocol.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+xdas_camera_service.o: xdas_camera_service.cpp xdas_camera_service.h \
+	xdas_camera_protocol.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
 rkuvc_gadget.o: $(UVC_ROOT)/uvc-gadget.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -115,11 +141,20 @@ aarch64:
 		RKAIQ_ROOT=$(CROSS_RKAIQ_ROOT) MPP_ROOT=$(CROSS_RKAIQ_ROOT) \
 		TOOLCHAIN_LIBC_LIB=$(CROSS_LIBC_LIB) all
 
+aarch64-package:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) \
+		CC=$(CROSS_CC) CXX=$(CROSS_CXX) \
+		RKAIQ_ROOT=$(CROSS_RKAIQ_ROOT) MPP_ROOT=$(CROSS_RKAIQ_ROOT) \
+		TOOLCHAIN_LIBC_LIB=$(CROSS_LIBC_LIB) \
+		all camera_transfer_sender camera_transfer_protocol_test
+
 check: camera_aiq_test
 	./camera_aiq_test --help
 	./camera_aiq_test --sync-bind-self-test
 	./camera_aiq_test --photo-exif-self-test
 	./camera_aiq_test --control-uart-protocol-self-test
+	./camera_aiq_test --xdas-protocol-self-test
 
 check-xvs-uart:
 	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
@@ -149,6 +184,45 @@ check-control-uart-host:
 		-lutil -lpthread -o camera_control_uart_test
 	./camera_control_uart_test
 
+check-xdas-uart:
+	g++ -O2 -Wall -Wextra -Wpedantic -std=c++17 \
+		xdas_camera_protocol.cpp xdas_camera_service.cpp \
+		xdas_camera_protocol_test.cpp \
+		-lutil -lpthread -o xdas_camera_protocol_test
+	./xdas_camera_protocol_test
+
+xdas_camera_save_integration_test: xdas_camera_save_integration_test.cpp \
+		xdas_camera_protocol.cpp xdas_camera_protocol.h \
+		xdas_camera_service.cpp xdas_camera_service.h \
+		camera_photo_backend.cpp camera_photo_backend.h photo_exif.cpp photo_exif.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) xdas_camera_save_integration_test.cpp \
+		xdas_camera_protocol.cpp xdas_camera_service.cpp \
+		camera_photo_backend.cpp photo_exif.cpp -lrockchip_mpp -lpthread -o $@
+
+check-xdas-save-rockchip: xdas_camera_save_integration_test
+	./xdas_camera_save_integration_test
+
+camera_transfer_sender: camera_transfer_sender.cpp camera_transfer_client.cpp \
+		camera_transfer_client.h camera_transfer_protocol.cpp \
+		camera_transfer_protocol.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) camera_transfer_sender.cpp \
+		camera_transfer_client.cpp camera_transfer_protocol.cpp -lcrypto -o $@
+
+camera_transfer_receiver: camera_transfer_receiver.cpp \
+		camera_transfer_protocol.cpp camera_transfer_protocol.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) camera_transfer_receiver.cpp \
+		camera_transfer_protocol.cpp -lcrypto -o $@
+
+camera_transfer_protocol_test: camera_transfer_protocol_test.cpp \
+		camera_transfer_protocol.cpp camera_transfer_protocol.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) \
+		camera_transfer_protocol_test.cpp camera_transfer_protocol.cpp \
+		-lcrypto -o $@
+
+check-camera-transfer: camera_transfer_protocol_test camera_transfer_sender \
+		camera_transfer_receiver
+	./camera_transfer_protocol_test
+
 stage6_host_test: stage6_host_test.cpp photo_exif.cpp photo_exif.h \
 	trigger_frame_binder.cpp trigger_frame_binder.h
 	$(CXX) $(CXXFLAGS) stage6_host_test.cpp photo_exif.cpp \
@@ -157,7 +231,19 @@ stage6_host_test: stage6_host_test.cpp photo_exif.cpp photo_exif.h \
 check-stage6-host: stage6_host_test
 	./stage6_host_test
 
+imx586_v4l2_metadata_test: imx586_v4l2_metadata_test.cpp \
+		imx586_v4l2_metadata.cpp imx586_v4l2_metadata.h
+	$(CXX) $(CXXFLAGS) imx586_v4l2_metadata_test.cpp \
+		imx586_v4l2_metadata.cpp -o $@
+
+check-imx586-v4l2-metadata: imx586_v4l2_metadata_test
+	./imx586_v4l2_metadata_test
+
 clean:
-	$(RM) $(TARGETS) $(OBJECTS) camera_control_uart_test \
-		xvs_uart_controller_test time_sync_service_test stage6_host_test \
-		stage7_time_pipeline_test
+		$(RM) $(TARGETS) $(OBJECTS) camera_control_uart_test \
+		xvs_uart_controller_test xdas_camera_protocol_test \
+		xdas_camera_save_integration_test \
+		camera_transfer_sender camera_transfer_receiver \
+		camera_transfer_protocol_test \
+		time_sync_service_test stage6_host_test stage7_time_pipeline_test \
+		imx586_v4l2_metadata_test

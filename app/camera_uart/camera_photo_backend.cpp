@@ -249,6 +249,14 @@ camera_photo::Metadata convert_metadata(const camera_photo_metadata_t &input)
     output.exposure_us = input.exposure_us;
     output.gain_x1000 = input.gain_x1000;
     output.iso = input.iso;
+    output.white_balance_valid = input.white_balance_valid != 0;
+    output.white_balance_auto = input.white_balance_auto != 0;
+    output.white_balance_converged = input.white_balance_converged != 0;
+    output.white_balance_cct = input.white_balance_cct;
+    output.wb_r_gain_x1000 = input.wb_r_gain_x1000;
+    output.wb_gr_gain_x1000 = input.wb_gr_gain_x1000;
+    output.wb_gb_gain_x1000 = input.wb_gb_gain_x1000;
+    output.wb_b_gain_x1000 = input.wb_b_gain_x1000;
     output.utc_valid = input.utc_valid != 0;
     output.trigger_monotonic_is_uart_arrival =
         input.trigger_monotonic_is_uart_arrival != 0;
@@ -302,28 +310,31 @@ struct camera_photo_backend {
 
 namespace {
 
-void write_csv_header(FILE *file)
+bool write_csv_header(FILE *file)
 {
-    std::fputs(
+    const int result = std::fputs(
         "camera_id,frame_id,trigger_id,trigger_source,trigger_monotonic_ns,"
         "trigger_realtime_ns,pps_id,trigger_timer_tick,utc_valid,"
         "trigger_monotonic_is_uart_arrival,frame_monotonic_ns,frame_realtime_ns,"
         "exposure_start_realtime_ns,exposure_center_realtime_ns,"
-        "exposure_us,gain_x1000,iso,iso_estimated,response_offset_ns,"
+        "exposure_us,gain_x1000,iso,white_balance_valid,white_balance_auto,"
+        "white_balance_converged,white_balance_cct,wb_r_gain_x1000,"
+        "wb_gr_gain_x1000,wb_gb_gain_x1000,wb_b_gain_x1000,iso_estimated,"
+        "response_offset_ns,"
         "trigger_to_frame_ns,exposure_source,jpeg_path\n",
         file);
-    std::fflush(file);
+    return result >= 0 && std::fflush(file) == 0;
 }
 
-void write_csv_record(FILE *file, const camera_photo_metadata_t &m,
+bool write_csv_record(FILE *file, const camera_photo_metadata_t &m,
                       const std::string &path)
 {
     if (!file)
-        return;
-    std::fprintf(
+        return false;
+    const int result = std::fprintf(
         file,
         "%d,%u,%llu,%s,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,"
-        "%u,%u,%u,%d,%lld,%lld,%s,%s\n",
+        "%u,%u,%u,%d,%d,%d,%u,%u,%u,%u,%u,%d,%lld,%lld,%s,%s\n",
         m.camera_id, m.frame_id,
         static_cast<unsigned long long>(m.trigger_id), m.trigger_source,
         static_cast<unsigned long long>(m.trigger_monotonic_ns),
@@ -335,11 +346,14 @@ void write_csv_record(FILE *file, const camera_photo_metadata_t &m,
         static_cast<unsigned long long>(m.frame_realtime_ns),
         static_cast<unsigned long long>(m.exposure_start_realtime_ns),
         static_cast<unsigned long long>(m.exposure_center_realtime_ns),
-        m.exposure_us, m.gain_x1000, m.iso, m.iso_estimated,
+        m.exposure_us, m.gain_x1000, m.iso, m.white_balance_valid,
+        m.white_balance_auto, m.white_balance_converged,
+        m.white_balance_cct, m.wb_r_gain_x1000, m.wb_gr_gain_x1000,
+        m.wb_gb_gain_x1000, m.wb_b_gain_x1000, m.iso_estimated,
         static_cast<long long>(m.sensor_response_offset_ns),
         static_cast<long long>(m.trigger_to_frame_ns), m.exposure_source,
         path.c_str());
-    std::fflush(file);
+    return result >= 0 && std::fflush(file) == 0;
 }
 
 int write_atomic(const std::string &path, const std::vector<uint8_t> &bytes)
@@ -405,7 +419,12 @@ void photo_worker(CameraPhotoStream *stream)
                     static_cast<unsigned long long>(
                         work.metadata.exposure_start_realtime_ns));
                 const std::string path = stream->output_dir + name;
-                const int write_error = write_atomic(path, with_exif);
+                int write_error = write_atomic(path, with_exif);
+                if (!write_error &&
+                    !write_csv_record(stream->csv, work.metadata, path)) {
+                    write_error = errno ? errno : EIO;
+                    unlink(path.c_str());
+                }
                 std::lock_guard<std::mutex> lock(stream->mutex);
                 if (write_error) {
                     stream->write_errors++;
@@ -417,8 +436,6 @@ void photo_worker(CameraPhotoStream *stream)
                     stream->last_frame_id = work.metadata.frame_id;
                     stream->last_trigger_id = work.metadata.trigger_id;
                     stream->last_photo = path;
-                    stream->last_error = CAMERA_PHOTO_OK;
-                    write_csv_record(stream->csv, work.metadata, path);
                 }
             }
         }
@@ -440,6 +457,7 @@ extern "C" void camera_photo_default_config(camera_photo_config_t *config)
     std::memset(config, 0, sizeof(*config));
     config->width = 4000;
     config->height = 3000;
+    config->camera_count = CAMERA_PHOTO_CAMERA_COUNT;
     config->jpeg_quality = 90;
     config->queue_depth = 2;
 }
@@ -454,7 +472,9 @@ extern "C" int camera_photo_create(const camera_photo_config_t *config,
     camera_photo_default_config(&selected);
     if (config)
         selected = *config;
-    if (!selected.width || !selected.height || !selected.queue_depth ||
+    if (!selected.width || !selected.height || !selected.camera_count ||
+        selected.camera_count > CAMERA_PHOTO_CAMERA_COUNT ||
+        !selected.queue_depth ||
         selected.jpeg_quality < 1 || selected.jpeg_quality > 99)
         return CAMERA_PHOTO_ERR_ARGUMENT;
     camera_photo_backend_t *backend =
@@ -462,7 +482,8 @@ extern "C" int camera_photo_create(const camera_photo_config_t *config,
     if (!backend)
         return CAMERA_PHOTO_ERR_IO;
     backend->config = selected;
-    for (int camera_id = 0; camera_id < CAMERA_PHOTO_CAMERA_COUNT;
+    for (int camera_id = 0;
+         camera_id < static_cast<int>(selected.camera_count);
          ++camera_id) {
         CameraPhotoStream &stream = backend->stream[camera_id];
         stream.backend = backend;
@@ -526,10 +547,19 @@ extern "C" int camera_photo_start(camera_photo_backend_t *backend,
         stream.encoder.shutdown();
         return CAMERA_PHOTO_ERR_IO;
     }
-    if (new_file)
-        write_csv_header(stream.csv);
+    if (new_file && !write_csv_header(stream.csv)) {
+        stream.last_errno = errno ? errno : EIO;
+        stream.last_error = CAMERA_PHOTO_ERR_IO;
+        std::fclose(stream.csv);
+        stream.csv = nullptr;
+        unlink(stream.metadata_csv.c_str());
+        stream.encoder.shutdown();
+        return CAMERA_PHOTO_ERR_IO;
+    }
     stream.enabled = true;
     stream.last_error = CAMERA_PHOTO_OK;
+    stream.last_mpp_error = MPP_OK;
+    stream.last_errno = 0;
     return CAMERA_PHOTO_OK;
 }
 
@@ -551,12 +581,24 @@ extern "C" int camera_photo_stop(camera_photo_backend_t *backend,
     stream.idle.wait(lock, [&stream] {
         return stream.queue.empty() && !stream.processing;
     });
+    int session_result = stream.last_error;
     if (stream.csv) {
-        std::fclose(stream.csv);
+        if ((std::fflush(stream.csv) != 0 || fsync(fileno(stream.csv)) != 0) &&
+            session_result == CAMERA_PHOTO_OK) {
+            stream.last_errno = errno ? errno : EIO;
+            stream.last_error = CAMERA_PHOTO_ERR_IO;
+            session_result = CAMERA_PHOTO_ERR_IO;
+        }
+        if (std::fclose(stream.csv) != 0 &&
+            session_result == CAMERA_PHOTO_OK) {
+            stream.last_errno = errno ? errno : EIO;
+            stream.last_error = CAMERA_PHOTO_ERR_IO;
+            session_result = CAMERA_PHOTO_ERR_IO;
+        }
         stream.csv = nullptr;
     }
     stream.encoder.shutdown();
-    return CAMERA_PHOTO_OK;
+    return session_result;
 }
 
 extern "C" int camera_photo_is_enabled(camera_photo_backend_t *backend,
@@ -620,21 +662,32 @@ extern "C" int camera_photo_submit_nv12(
     std::lock_guard<std::mutex> lock(stream.mutex);
     if (!stream.enabled)
         return CAMERA_PHOTO_ERR_NOT_RUNNING;
-    if (!metadata->trigger_id || !metadata->trigger_realtime_ns ||
-        !metadata->exposure_us || !metadata->iso) {
+    if (!metadata->frame_realtime_ns ||
+        !metadata->exposure_start_realtime_ns || !metadata->exposure_us ||
+        !metadata->iso ||
+        (metadata->trigger_id && !metadata->trigger_realtime_ns)) {
         stream.invalid_metadata++;
+        stream.last_error = CAMERA_PHOTO_ERR_ARGUMENT;
         return CAMERA_PHOTO_ERR_ARGUMENT;
     }
-    PhotoWork work;
-    work.nv12.resize(y_size + uv_size);
-    std::memcpy(work.nv12.data(), plane0, y_size);
-    std::memcpy(work.nv12.data() + y_size, plane1, uv_size);
-    work.metadata = *metadata;
-    if (stream.queue.size() >= backend->config.queue_depth) {
-        stream.queue.pop_front();
+    try {
+        PhotoWork work;
+        work.nv12.resize(y_size + uv_size);
+        std::memcpy(work.nv12.data(), plane0, y_size);
+        std::memcpy(work.nv12.data() + y_size, plane1, uv_size);
+        work.metadata = *metadata;
+        if (stream.queue.size() >= backend->config.queue_depth) {
+            stream.queue.pop_front();
+            stream.queue_drops++;
+            stream.last_error = CAMERA_PHOTO_ERR_QUEUE_FULL;
+        }
+        stream.queue.push_back(std::move(work));
+    } catch (const std::bad_alloc &) {
         stream.queue_drops++;
+        stream.last_errno = ENOMEM;
+        stream.last_error = CAMERA_PHOTO_ERR_IO;
+        return CAMERA_PHOTO_ERR_IO;
     }
-    stream.queue.push_back(std::move(work));
     stream.frames_submitted++;
     stream.condition.notify_one();
     return CAMERA_PHOTO_OK;
@@ -699,6 +752,8 @@ extern "C" const char *camera_photo_strerror(int result)
         return "MPP JPEG encoder failed";
     case CAMERA_PHOTO_ERR_EXIF:
         return "unable to insert JPEG EXIF";
+    case CAMERA_PHOTO_ERR_QUEUE_FULL:
+        return "photo queue overflowed and a frame was dropped";
     default:
         return "unknown photo output error";
     }
