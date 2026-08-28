@@ -573,6 +573,12 @@
 	status = "okay";
 };
 
+/* v0.1.5 test: 使能 mpp-vcodec (rockchip,vcodec)，否则 mpp_service 无设备可绑定，
+ * MPP JPEG 编码失败 (-405)，photo-start 无法出图 */
+&mpp_vcodec {
+	status = "okay";
+};
+
 &rknpu {
 	rknpu-supply = <&vdd_npu>;
 	status = "okay";
