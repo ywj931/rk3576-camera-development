@@ -4,6 +4,7 @@
 #include "camera_photo_backend.h"
 #include "camera_uvc_backend.h"
 #include "capture_backend.h"
+#include "gnss_time_source.h"
 #include "photo_exif.h"
 #include "time_sync_service.h"
 #include "trigger_frame_binder.h"
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <linux/videodev2.h>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -143,6 +145,15 @@ uint64_t realtime_us()
            static_cast<uint64_t>(now.tv_nsec) / 1000ULL;
 }
 
+uint64_t monotonic_ns()
+{
+    struct timespec now = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return 0;
+    return static_cast<uint64_t>(now.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(now.tv_nsec);
+}
+
 void print_usage(const char *program)
 {
     std::cout
@@ -174,6 +185,12 @@ void print_usage(const char *program)
         << "  --xdas-protocol-self-test  test xdas framing and command mapping\n"
         << "  --sync-uart DEVICE  legacy separate MCU XVS/time-event UART\n"
         << "  --sync-timer-hz HZ  MCU high-resolution timer frequency (default: 1000000)\n"
+        << "  --gnss-uart DEVICE  direct GNSS GPRMC/GNRMC input UART\n"
+        << "  --gnss-baud BAUD    direct GNSS UART baud (default: 115200)\n"
+        << "  --pps-device DEVICE Linux PPS device (normally /dev/pps0)\n"
+        << "  --gnss-rmc-delay-ms MS  maximum RMC delay after PPS (default: 900)\n"
+        << "  --gnss-time-self-test  test direct GPRMC/PPS UTC mapping without hardware\n"
+        << "  --gnss-monitor       print direct GNSS/PPS lock status without opening cameras\n"
         << "  --xvs-autostart-hz 4  start the shared 4 Hz XVS timebase after capture starts\n"
         << "  --xvs-low-pulse-us US  autostart XVS low width (default: 10)\n"
         << "  --sync-protocol-self-test  test XVS protocol without camera hardware\n"
@@ -373,7 +390,8 @@ void print_xvs_controller_status(xvs_uart_controller_t *controller)
               << " device=\"" << status.device << "\"\n";
 }
 
-void print_time_sync_status(time_sync_service_t *time_sync)
+void print_time_sync_status(time_sync_service_t *time_sync,
+                            gnss_time_source_t *gnss_time)
 {
     time_sync_status_t status = {};
     const int result = time_sync_get_status(time_sync, &status);
@@ -397,7 +415,38 @@ void print_time_sync_status(time_sync_service_t *time_sync)
               << " last_pps_tick=" << status.last_pps_tick
               << " last_rmc_pps_id=" << status.last_rmc_pps_id
               << " last_rmc_utc_sec=" << status.last_rmc_utc_sec
-              << " reference_utc_ns=" << status.reference_utc_ns << '\n';
+              << " reference_utc_ns=" << status.reference_utc_ns
+              << " source=" << (gnss_time ? "DIRECT_GNSS" : "MCU_UART")
+              << '\n';
+    if (!gnss_time)
+        return;
+    gnss_time_source_status_t gnss = {};
+    const int gnss_result = gnss_time_source_get_status(gnss_time, &gnss);
+    if (gnss_result != GNSS_TIME_OK) {
+        std::cout << "GNSS_TIME_STATUS error=" << gnss_result << '\n';
+        return;
+    }
+    std::cout << "GNSS_TIME_STATUS running=" << gnss.running
+              << " uart_connected=" << gnss.uart_connected
+              << " pps_connected=" << gnss.pps_connected
+              << " uart=\"" << gnss.uart_device << "\""
+              << " baud=" << gnss.uart_baud
+              << " pps_device=\"" << gnss.pps_device << "\""
+              << " pps_events=" << gnss.pps_events
+              << " rmc_events=" << gnss.rmc_events
+              << " invalid_rmc=" << gnss.invalid_rmc_events
+              << " unpaired_rmc=" << gnss.unpaired_rmc_events
+              << " last_pps_id=" << gnss.last_pps_id
+              << " kernel_pps_sequence=" << gnss.last_kernel_pps_sequence
+              << " last_pps_monotonic_ns="
+              << gnss.last_pps_monotonic_ns
+              << " clock_sample_span_ns=" << gnss.last_clock_sample_span_ns
+              << " uart_open_errors=" << gnss.uart_open_errors
+              << " pps_open_errors=" << gnss.pps_open_errors
+              << " pps_fetch_errors=" << gnss.pps_fetch_errors
+              << " mapping_errors=" << gnss.time_mapping_errors
+              << " last_error=" << gnss.last_error
+              << " last_errno=" << gnss.last_errno << '\n';
 }
 
 void print_trigger_binding_status(trigger_frame_binder_t *binder)
@@ -516,6 +565,7 @@ void simulator_to_trigger_binder(uint64_t trigger_id, uint64_t monotonic_ns,
 
 struct xvs_event_context {
     time_sync_service_t *time_sync = nullptr;
+    gnss_time_source_t *gnss_time = nullptr;
     trigger_frame_binder_t *binder = nullptr;
     std::atomic<uint64_t> event_errors{0};
 };
@@ -528,20 +578,25 @@ void xvs_event_to_time_and_frame(const xvs_uart_event_t *event,
         return;
 
     int result = TIME_SYNC_OK;
-    if (event->type == XVS_UART_EVENT_PPS) {
+    if (event->type == XVS_UART_EVENT_PPS && !context->gnss_time) {
         result = time_sync_on_pps(context->time_sync, event->pps_id,
                                   event->timer_tick);
-    } else if (event->type == XVS_UART_EVENT_RMC) {
+    } else if (event->type == XVS_UART_EVENT_RMC && !context->gnss_time) {
         result = time_sync_on_rmc_utc(context->time_sync, event->pps_id,
                                       event->utc_sec, event->valid);
-    } else if (event->type == XVS_UART_EVENT_NMEA) {
+    } else if (event->type == XVS_UART_EVENT_NMEA && !context->gnss_time) {
         result = time_sync_on_nmea_rmc(context->time_sync, event->pps_id,
                                        event->nmea);
     } else if (event->type == XVS_UART_EVENT_XVS) {
         time_sync_resolution_t resolution = {};
-        const int resolve_result = time_sync_resolve_tick(
-            context->time_sync, event->pps_id, event->timer_tick,
-            &resolution);
+        const int resolve_result = context->gnss_time
+                                       ? gnss_time_source_resolve_monotonic_ns(
+                                             context->gnss_time,
+                                             event->uart_receive_monotonic_ns,
+                                             &resolution)
+                                       : time_sync_resolve_tick(
+                                             context->time_sync, event->pps_id,
+                                             event->timer_tick, &resolution);
         trigger_frame_trigger_t trigger = {};
         trigger.trigger_id = event->trigger_id;
         trigger.monotonic_ns = event->uart_receive_monotonic_ns;
@@ -549,16 +604,24 @@ void xvs_event_to_time_and_frame(const xvs_uart_event_t *event,
             resolve_result == TIME_SYNC_OK && resolution.valid
                 ? resolution.utc_ns
                 : event->uart_receive_realtime_ns;
-        trigger.pps_id = event->pps_id;
+        trigger.pps_id = context->gnss_time && resolution.valid
+                             ? resolution.pps_id
+                             : event->pps_id;
         trigger.timer_tick = event->timer_tick;
         trigger.utc_valid =
             resolve_result == TIME_SYNC_OK && resolution.valid ? 1 : 0;
         trigger.monotonic_is_uart_arrival = 1;
-        trigger.source = trigger.utc_valid
-                             ? (resolution.state == TIME_SYNC_STATE_HOLDOVER
-                                    ? "MCU_PPS_HOLDOVER"
-                                    : "MCU_PPS_LOCKED")
-                             : "MCU_PPS_UNLOCKED";
+        trigger.source =
+            trigger.utc_valid
+                ? (context->gnss_time
+                       ? (resolution.state == TIME_SYNC_STATE_HOLDOVER
+                              ? "GNSS_PPS_HOLDOVER_UART_ARRIVAL"
+                              : "GNSS_PPS_LOCKED_UART_ARRIVAL")
+                       : (resolution.state == TIME_SYNC_STATE_HOLDOVER
+                              ? "MCU_PPS_HOLDOVER"
+                              : "MCU_PPS_LOCKED"))
+                : (context->gnss_time ? "GNSS_PPS_UNLOCKED_UART_ARRIVAL"
+                                      : "MCU_PPS_UNLOCKED");
         result = trigger_frame_binder_on_trigger_ex(context->binder,
                                                      &trigger);
     }
@@ -825,6 +888,7 @@ struct output_backends {
     capture_backend_t *capture = nullptr;
     trigger_frame_binder_t *binder = nullptr;
     camera_photo_backend_t *photo = nullptr;
+    gnss_time_source_t *gnss_time = nullptr;
 };
 
 void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
@@ -880,6 +944,22 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
     metadata.frame_realtime_ns = trigger_bound
                                      ? match.realtime_dequeue_ns
                                      : capture_status.last_realtime_dequeue_ns;
+    time_sync_resolution_t gnss_resolution = {};
+    const uint32_t timestamp_flags =
+        trigger_bound ? match.buffer_flags : capture_status.last_buffer_flags;
+    const bool v4l2_monotonic =
+        (timestamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+        V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    const bool gnss_utc_valid =
+        outputs->gnss_time && v4l2_monotonic &&
+        gnss_time_source_resolve_monotonic_ns(
+            outputs->gnss_time, metadata.frame_monotonic_ns,
+            &gnss_resolution) == GNSS_TIME_OK &&
+        gnss_resolution.valid;
+    if (gnss_utc_valid) {
+        metadata.frame_realtime_ns = gnss_resolution.utc_ns;
+        metadata.pps_id = gnss_resolution.pps_id;
+    }
     metadata.trigger_to_frame_ns =
         trigger_bound ? match.trigger_to_frame_ns : 0;
     camera_photo_get_response_offset(outputs->photo, camera_id,
@@ -900,7 +980,14 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
         metadata.wb_gb_gain_x1000 = camera_status.wb_gb_gain_x1000;
         metadata.wb_b_gain_x1000 = camera_status.wb_b_gain_x1000;
     }
-    if (trigger_bound) {
+    if (gnss_utc_valid) {
+        const uint64_t exposure_ns =
+            static_cast<uint64_t>(metadata.exposure_us) * 1000ULL;
+        metadata.exposure_start_realtime_ns =
+            metadata.frame_realtime_ns > exposure_ns
+                ? metadata.frame_realtime_ns - exposure_ns
+                : metadata.frame_realtime_ns;
+    } else if (trigger_bound) {
         metadata.exposure_start_realtime_ns = add_signed_ns(
             metadata.trigger_realtime_ns, metadata.sensor_response_offset_ns);
     } else {
@@ -914,12 +1001,15 @@ void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
     metadata.exposure_center_realtime_ns =
         metadata.exposure_start_realtime_ns +
         static_cast<uint64_t>(metadata.exposure_us) * 500ULL;
-    metadata.utc_valid = trigger_bound ? match.utc_valid : 0;
+    metadata.utc_valid =
+        gnss_utc_valid || (trigger_bound && match.utc_valid) ? 1 : 0;
     metadata.trigger_monotonic_is_uart_arrival =
         trigger_bound ? match.monotonic_is_uart_arrival : 0;
     std::snprintf(metadata.trigger_source,
                   sizeof(metadata.trigger_source), "%s",
-                  trigger_bound ? match.source : "UNBOUND");
+                  trigger_bound ? match.source
+                                : (gnss_utc_valid ? "GNSS_PPS_FRAME_TIME"
+                                                  : "UNBOUND"));
     std::snprintf(metadata.exposure_source,
                   sizeof(metadata.exposure_source), "%s",
                   status_result == CAMERA_BACKEND_OK &&
@@ -1178,6 +1268,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
                      camera_photo_backend_t *photo,
                      xvs_uart_controller_t *xvs,
                      time_sync_service_t *time_sync,
+                     gnss_time_source_t *gnss_time,
                      trigger_frame_binder_t *binder,
                      trigger_simulator_t *simulator,
                      const std::string &line)
@@ -1655,7 +1746,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             invalid_command(command, "time-sync-status");
             return true;
         }
-        print_time_sync_status(time_sync);
+        print_time_sync_status(time_sync, gnss_time);
         return true;
     }
 
@@ -1807,7 +1898,7 @@ bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
             return true;
         }
         print_xvs_controller_status(xvs);
-        print_time_sync_status(time_sync);
+        print_time_sync_status(time_sync, gnss_time);
         print_sync_status(capture);
         print_trigger_binding_status(binder);
         print_trigger_simulator_status(simulator);
@@ -2015,6 +2106,7 @@ struct unified_uart_control_context {
     camera_photo_backend_t *photo = nullptr;
     xvs_uart_controller_t *xvs = nullptr;
     time_sync_service_t *time_sync = nullptr;
+    gnss_time_source_t *gnss_time = nullptr;
     trigger_frame_binder_t *binder = nullptr;
     trigger_simulator_t *simulator = nullptr;
     std::mutex command_mutex;
@@ -2035,7 +2127,7 @@ int process_unified_uart_control(const char *request, char *response,
         std::streambuf *saved = std::cout.rdbuf(captured.rdbuf());
         execute_command(context->backend, context->capture, context->uvc,
                         context->net, context->photo, context->xvs,
-                        context->time_sync, context->binder,
+                        context->time_sync, context->gnss_time, context->binder,
                         context->simulator, command);
         std::cout.flush();
         std::cout.rdbuf(saved);
@@ -2256,6 +2348,8 @@ int main(int argc, char **argv)
     capture_backend_default_config(&capture_config);
     time_sync_config_t time_sync_config = {};
     time_sync_default_config(&time_sync_config);
+    gnss_time_source_config_t gnss_time_config = {};
+    gnss_time_source_default_config(&gnss_time_config);
     std::string iq_dirs[CAMERA_BACKEND_CAMERA_COUNT];
     std::string expected_sensors[CAMERA_BACKEND_CAMERA_COUNT];
     std::string params_devices[CAMERA_BACKEND_CAMERA_COUNT];
@@ -2272,12 +2366,16 @@ int main(int argc, char **argv)
     bool photo_exif_self_test = false;
     bool control_uart_protocol_self_test = false;
     bool xdas_protocol_self_test = false;
+    bool gnss_time_self_test = false;
+    bool gnss_monitor = false;
     uint32_t xvs_autostart_hz = 0;
     uint32_t xvs_low_pulse_us = 10;
     std::string unified_uart_device;
     std::string sync_uart_device;
     std::string control_uart_device;
     std::string xdas_uart_device;
+    std::string gnss_uart_device;
+    std::string pps_device;
     xdas_camera_service::config xdas_service_config;
 
     for (int index = 1; index < argc; ++index) {
@@ -2329,6 +2427,14 @@ int main(int argc, char **argv)
         }
         if (option == "--xdas-protocol-self-test") {
             xdas_protocol_self_test = true;
+            continue;
+        }
+        if (option == "--gnss-time-self-test") {
+            gnss_time_self_test = true;
+            continue;
+        }
+        if (option == "--gnss-monitor") {
+            gnss_monitor = true;
             continue;
         }
         if (index + 1 >= argc) {
@@ -2389,6 +2495,22 @@ int main(int argc, char **argv)
                           << '\n';
                 return EXIT_FAILURE;
             }
+        } else if (option == "--gnss-uart") {
+            gnss_uart_device = value;
+        } else if (option == "--gnss-baud") {
+            if (!parse_u32(value, &gnss_time_config.uart_baud)) {
+                std::cerr << "Invalid GNSS UART baud: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--pps-device") {
+            pps_device = value;
+        } else if (option == "--gnss-rmc-delay-ms") {
+            if (!parse_u32(value, &gnss_time_config.max_rmc_delay_ms) ||
+                !gnss_time_config.max_rmc_delay_ms ||
+                gnss_time_config.max_rmc_delay_ms > 5000) {
+                std::cerr << "Invalid GNSS RMC delay: " << value << '\n';
+                return EXIT_FAILURE;
+            }
         } else if (option == "--xvs-autostart-hz") {
             if (!parse_u32(value, &xvs_autostart_hz) ||
                 xvs_autostart_hz != 4) {
@@ -2421,6 +2543,31 @@ int main(int argc, char **argv)
     capture_config.camera_count = camera_count;
     xdas_service_config.camera_count =
         static_cast<std::uint8_t>(camera_count);
+    const bool direct_gnss_enabled =
+        !gnss_uart_device.empty() || !pps_device.empty();
+    if (direct_gnss_enabled &&
+        (gnss_uart_device.empty() || pps_device.empty())) {
+        std::cerr << "GNSS_CONFIGURATION_FAILED reason=\"--gnss-uart and "
+                     "--pps-device must be provided together\"\n";
+        return EXIT_FAILURE;
+    }
+    if (direct_gnss_enabled && !xdas_uart_device.empty() &&
+        gnss_uart_device == xdas_uart_device) {
+        std::cerr << "GNSS_CONFIGURATION_FAILED reason=\"GNSS input and xdas "
+                     "control require different UART devices\"\n";
+        return EXIT_FAILURE;
+    }
+    if (direct_gnss_enabled && !sync_uart_device.empty() &&
+        gnss_uart_device == sync_uart_device) {
+        std::cerr << "GNSS_CONFIGURATION_FAILED reason=\"GNSS input and MCU "
+                     "sync require different UART devices\"\n";
+        return EXIT_FAILURE;
+    }
+    if (direct_gnss_enabled) {
+        gnss_time_config.uart_device = gnss_uart_device.c_str();
+        gnss_time_config.pps_device = pps_device.c_str();
+        time_sync_config.timer_frequency_hz = 1000000000ULL;
+    }
 
     if (!unified_uart_device.empty()) {
         if ((!sync_uart_device.empty() &&
@@ -2433,6 +2580,13 @@ int main(int argc, char **argv)
         }
         sync_uart_device = unified_uart_device;
         control_uart_device = unified_uart_device;
+    }
+    if (direct_gnss_enabled &&
+        (gnss_uart_device == sync_uart_device ||
+         gnss_uart_device == control_uart_device)) {
+        std::cerr << "GNSS_CONFIGURATION_FAILED reason=\"GNSS input and MCU "
+                     "or camera control require different UART devices\"\n";
+        return EXIT_FAILURE;
     }
     const bool shared_uart = !sync_uart_device.empty() &&
                              sync_uart_device == control_uart_device;
@@ -2471,6 +2625,55 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    if (gnss_time_self_test) {
+        char report[256] = {};
+        const int gnss_result =
+            gnss_time_source_self_test(report, sizeof(report));
+        if (gnss_result != GNSS_TIME_OK) {
+            std::cerr << "GNSS_TIME_SELF_TEST_FAILED code=" << gnss_result
+                      << " reason=\"" << gnss_time_source_strerror(gnss_result)
+                      << "\" detail=\"" << report << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "GNSS_TIME_SELF_TEST_OK detail=\"" << report
+                  << "\"\n";
+        return EXIT_SUCCESS;
+    }
+    if (gnss_monitor) {
+        if (!direct_gnss_enabled) {
+            std::cerr << "GNSS_MONITOR_CONFIGURATION_FAILED reason=\"provide "
+                         "--gnss-uart and --pps-device\"\n";
+            return EXIT_FAILURE;
+        }
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
+        time_sync_service_t *monitor_time_sync = nullptr;
+        int monitor_result =
+            time_sync_create(&time_sync_config, &monitor_time_sync);
+        gnss_time_source_t *monitor_source = nullptr;
+        if (monitor_result == TIME_SYNC_OK)
+            monitor_result = gnss_time_source_create(
+                &gnss_time_config, monitor_time_sync, &monitor_source);
+        if (monitor_result == GNSS_TIME_OK)
+            monitor_result = gnss_time_source_start(monitor_source);
+        if (monitor_result != GNSS_TIME_OK) {
+            std::cerr << "GNSS_MONITOR_START_FAILED code=" << monitor_result
+                      << " reason=\""
+                      << gnss_time_source_strerror(monitor_result) << "\"\n";
+            gnss_time_source_destroy(monitor_source);
+            time_sync_destroy(monitor_time_sync);
+            return EXIT_FAILURE;
+        }
+        std::cout << "GNSS_MONITOR_READY cmos_trigger=0 system_clock_step=0\n";
+        while (!g_stop) {
+            print_time_sync_status(monitor_time_sync, monitor_source);
+            for (int part = 0; part < 10 && !g_stop; ++part)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        gnss_time_source_destroy(monitor_source);
+        time_sync_destroy(monitor_time_sync);
+        return EXIT_SUCCESS;
+    }
     if (sync_protocol_self_test) {
         const int protocol_result = xvs_uart_protocol_self_test();
         if (protocol_result != XVS_UART_OK) {
@@ -2688,8 +2891,38 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    gnss_time_source_t *gnss_time = nullptr;
+    if (direct_gnss_enabled) {
+        result = gnss_time_source_create(&gnss_time_config, time_sync,
+                                         &gnss_time);
+        if (result == GNSS_TIME_OK)
+            result = gnss_time_source_start(gnss_time);
+        if (result != GNSS_TIME_OK) {
+            std::cerr << "GNSS_TIME_START_FAILED code=" << result
+                      << " reason=\"" << gnss_time_source_strerror(result)
+                      << "\"\n";
+            gnss_time_source_destroy(gnss_time);
+            trigger_simulator_destroy(simulator);
+            time_sync_destroy(time_sync);
+            trigger_frame_binder_destroy(binder);
+            camera_photo_destroy(photo);
+            camera_net_destroy(net);
+            camera_uvc_destroy(uvc);
+            capture_backend_destroy(capture);
+            camera_backend_destroy(backend);
+            return EXIT_FAILURE;
+        }
+        outputs.gnss_time = gnss_time;
+        std::cout << "GNSS_TIME_READY uart=\"" << gnss_uart_device
+                  << "\" baud=" << gnss_time_config.uart_baud
+                  << " pps_device=\"" << pps_device
+                  << "\" mode=APPLICATION_TIMESTAMP_ONLY"
+                  << " cmos_trigger=0 system_clock_step=0\n";
+    }
+
     xvs_event_context xvs_events;
     xvs_events.time_sync = time_sync;
+    xvs_events.gnss_time = gnss_time;
     xvs_events.binder = binder;
     unified_uart_control_context unified_control;
     unified_control.backend = backend;
@@ -2698,6 +2931,7 @@ int main(int argc, char **argv)
     unified_control.net = net;
     unified_control.photo = photo;
     unified_control.time_sync = time_sync;
+    unified_control.gnss_time = gnss_time;
     unified_control.binder = binder;
     unified_control.simulator = simulator;
     xvs_uart_controller_t *xvs = nullptr;
@@ -2721,6 +2955,7 @@ int main(int argc, char **argv)
                       << "\"\n";
             xvs_uart_destroy(xvs);
             trigger_simulator_destroy(simulator);
+            gnss_time_source_destroy(gnss_time);
             time_sync_destroy(time_sync);
             trigger_frame_binder_destroy(binder);
             camera_photo_destroy(photo);
@@ -2752,6 +2987,7 @@ int main(int argc, char **argv)
         !autostart_capture_only(capture, camera_count)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
         time_sync_destroy(time_sync);
         trigger_frame_binder_destroy(binder);
         camera_photo_destroy(photo);
@@ -2767,6 +3003,7 @@ int main(int argc, char **argv)
                                xvs_low_pulse_us)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
         time_sync_destroy(time_sync);
         capture_backend_destroy(capture);
         trigger_frame_binder_destroy(binder);
@@ -2781,6 +3018,7 @@ int main(int argc, char **argv)
         !autostart_http_outputs(capture, net)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
         time_sync_destroy(time_sync);
         capture_backend_destroy(capture);
         trigger_frame_binder_destroy(binder);
@@ -2796,6 +3034,7 @@ int main(int argc, char **argv)
                               xvs_low_pulse_us)) {
         xvs_uart_destroy(xvs);
         trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
         time_sync_destroy(time_sync);
         capture_backend_destroy(capture);
         trigger_frame_binder_destroy(binder);
@@ -2816,7 +3055,8 @@ int main(int argc, char **argv)
             if (!std::getline(std::cin, line))
                 break;
             if (!execute_command(backend, capture, uvc, net, photo, xvs,
-                                 time_sync, binder, simulator, line))
+                                 time_sync, gnss_time, binder, simulator,
+                                 line))
                 break;
         }
     };
@@ -2866,7 +3106,18 @@ int main(int argc, char **argv)
         return filesystem_capacity_mb(xdas_service_config.save_root, free_mb,
                                       total_mb);
     };
-    xdas_operations.realtime_us = realtime_us;
+    xdas_operations.realtime_us = [&]() -> uint64_t {
+        if (gnss_time) {
+            const uint64_t now_ns = monotonic_ns();
+            time_sync_resolution_t resolution = {};
+            if (now_ns && gnss_time_source_resolve_monotonic_ns(
+                              gnss_time, now_ns, &resolution) == GNSS_TIME_OK &&
+                resolution.valid) {
+                return resolution.utc_ns / 1000ULL;
+            }
+        }
+        return realtime_us();
+    };
     xdas_operations.set_realtime_us = [&](uint64_t timestamp_us) {
         for (int camera_id = 0; camera_id < static_cast<int>(camera_count);
              ++camera_id) {
@@ -2937,7 +3188,7 @@ int main(int argc, char **argv)
             std::ostringstream capture_output;
             std::streambuf *saved = std::cout.rdbuf(capture_output.rdbuf());
             execute_command(backend, capture, uvc, net, photo, xvs,
-                            time_sync, binder, simulator, command);
+                            time_sync, gnss_time, binder, simulator, command);
             std::cout.flush();
             std::cout.rdbuf(saved);
             *output = capture_output.str();
@@ -2971,6 +3222,7 @@ int main(int argc, char **argv)
     trigger_simulator_destroy(simulator);
     capture_backend_destroy(capture);
     trigger_frame_binder_destroy(binder);
+    gnss_time_source_destroy(gnss_time);
     time_sync_destroy(time_sync);
     camera_photo_destroy(photo);
     camera_net_destroy(net);

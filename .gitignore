@@ -14,3 +14,8 @@ backups/
 captures/
 test_results/
 output/
+
+# Generated board artifacts and host-side test binaries
+pcl_1126b/artifacts/
+tmp/
+app/camera_uart/*_test

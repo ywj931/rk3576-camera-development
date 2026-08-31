@@ -35,6 +35,14 @@
 		regulator-boot-on;
 		pwm-supply = <&vcc5v0_sys>;
 	};
+
+	gnss_pps: pps {
+		compatible = "pps-gpio";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pcl_gnss_pps_pin>;
+		gpios = <&gpio3 RK_PB1 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
 };
 
 &cpu0 {
@@ -147,6 +155,16 @@
 };
 
 &pinctrl {
+	pcl-gnss {
+		pcl_gnss_uart2_rx_pin: gnss-uart2-rx-pin {
+			rockchip,pins = <3 RK_PB0 4 &pcfg_pull_up>;
+		};
+
+		pcl_gnss_pps_pin: gnss-pps-pin {
+			rockchip,pins = <3 RK_PB1 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+	};
+
 	pcl-pmic {
 		pcl_pmic_int: pmic-int {
 			rockchip,pins = <0 RK_PC0 RK_FUNC_GPIO &pcfg_pull_up>;
@@ -199,9 +217,15 @@
 	};
 };
 
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1m1_xfer_pins>;
+	status = "okay";
+};
+
 &uart2 {
 	pinctrl-names = "default";
-	pinctrl-0 = <&uart2m0_xfer_pins>;
+	pinctrl-0 = <&pcl_gnss_uart2_rx_pin>;
 	status = "okay";
 };
 
@@ -573,8 +597,12 @@
 	status = "okay";
 };
 
-/* v0.1.5 test: 使能 mpp-vcodec (rockchip,vcodec)，否则 mpp_service 无设备可绑定，
- * MPP JPEG 编码失败 (-405)，photo-start 无法出图 */
+/* MPP codecs attach to this common service before registering devices. */
+&mpp_srv {
+	status = "okay";
+};
+
+/* Keep the generic vcodec interface available to the userspace MPP library. */
 &mpp_vcodec {
 	status = "okay";
 };

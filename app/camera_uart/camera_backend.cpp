@@ -44,6 +44,35 @@ constexpr unsigned long kGetXvsInputThin =
     _IOR('V', BASE_VIDIOC_PRIVATE + 48, uint32_t);
 constexpr uint32_t kStreamStartEvent = V4L2_EVENT_PRIVATE_START + 1;
 constexpr uint32_t kStreamStopEvent = V4L2_EVENT_PRIVATE_START + 2;
+constexpr char kV4lSubdevPrefix[] = "v4l-subdev";
+constexpr size_t kV4lSubdevPrefixLength = sizeof(kV4lSubdevPrefix) - 1;
+
+constexpr bool is_decimal_digit(char value)
+{
+    return value >= '0' && value <= '9';
+}
+
+constexpr bool is_v4l_subdev_basename(const char *name)
+{
+    if (!name)
+        return false;
+    for (size_t index = 0; index < kV4lSubdevPrefixLength; ++index) {
+        if (name[index] != kV4lSubdevPrefix[index])
+            return false;
+    }
+    if (!is_decimal_digit(name[kV4lSubdevPrefixLength]))
+        return false;
+    for (size_t index = kV4lSubdevPrefixLength + 1; name[index]; ++index) {
+        if (!is_decimal_digit(name[index]))
+            return false;
+    }
+    return true;
+}
+
+static_assert(is_v4l_subdev_basename("v4l-subdev0"));
+static_assert(is_v4l_subdev_basename("v4l-subdev123"));
+static_assert(!is_v4l_subdev_basename("v4l-subdev"));
+static_assert(!is_v4l_subdev_basename("v4l-subdevice0"));
 
 struct CameraSlot {
     std::mutex mutex;
@@ -72,6 +101,68 @@ bool directory_exists(const char *path)
     return path != nullptr && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+bool character_device_exists(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    struct stat info = {};
+    return stat(path, &info) == 0 && S_ISCHR(info.st_mode);
+}
+
+bool same_character_device(const char *left, const char *right)
+{
+    if (!left || !right || !left[0] || !right[0])
+        return false;
+    struct stat left_info = {};
+    struct stat right_info = {};
+    return stat(left, &left_info) == 0 && S_ISCHR(left_info.st_mode) &&
+           stat(right, &right_info) == 0 && S_ISCHR(right_info.st_mode) &&
+           left_info.st_rdev == right_info.st_rdev;
+}
+
+std::string video4linux_device_name(const char *device)
+{
+    if (!device || !device[0])
+        return {};
+    const char *basename = std::strrchr(device, '/');
+    basename = basename ? basename + 1 : device;
+    if (!is_v4l_subdev_basename(basename))
+        return {};
+    const std::string path =
+        std::string("/sys/class/video4linux/") + basename + "/name";
+    FILE *file = std::fopen(path.c_str(), "r");
+    if (!file)
+        return {};
+    char name[256] = {};
+    const bool read_ok = std::fgets(name, sizeof(name), file) != nullptr;
+    std::fclose(file);
+    if (!read_ok)
+        return {};
+    name[std::strcspn(name, "\r\n")] = '\0';
+    return name;
+}
+
+uint32_t count_sensor_subdevices(const char *expected_sensor)
+{
+    if (!expected_sensor || !expected_sensor[0])
+        return 0;
+    DIR *directory = opendir("/sys/class/video4linux");
+    if (!directory)
+        return 0;
+    uint32_t count = 0;
+    while (const dirent *entry = readdir(directory)) {
+        if (!is_v4l_subdev_basename(entry->d_name))
+            continue;
+        const std::string device = std::string("/dev/") + entry->d_name;
+        if (video4linux_device_name(device.c_str()).find(expected_sensor) !=
+            std::string::npos) {
+            ++count;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+
 std::string discover_sensor_device(const std::string &sensor_name)
 {
     DIR *directory = opendir("/sys/class/video4linux");
@@ -80,7 +171,7 @@ std::string discover_sensor_device(const std::string &sensor_name)
 
     std::string result;
     while (dirent *entry = readdir(directory)) {
-        if (std::strncmp(entry->d_name, "v4l-subdev", 10) != 0)
+        if (!is_v4l_subdev_basename(entry->d_name))
             continue;
         const std::string sysfs_name =
             std::string("/sys/class/video4linux/") + entry->d_name + "/name";
@@ -481,14 +572,74 @@ extern "C" int camera_backend_create(const camera_backend_config_t *config,
     for (int camera_id = 0;
          camera_id < static_cast<int>(config->camera_count);
          ++camera_id) {
-        if (!directory_exists(config->iq_dir[camera_id]) ||
-            config->params_device[camera_id] == nullptr ||
-            config->params_device[camera_id][0] == '\0') {
-            std::fprintf(stderr, "CAMERA_CONFIG_ERROR camera_id=%d iq_dir=%s\n",
+        const char *iq_dir = config->iq_dir[camera_id];
+        const char *params_device = config->params_device[camera_id];
+        const char *sensor_device = config->sensor_device[camera_id];
+        const char *expected_sensor = config->expected_sensor[camera_id];
+        if (!directory_exists(iq_dir)) {
+            std::fprintf(stderr,
+                         "CAMERA_PREFLIGHT_ERROR camera_id=%d reason=iq_directory_missing path=%s\n",
+                         camera_id, iq_dir ? iq_dir : "(null)");
+            return CAMERA_BACKEND_ERR_IO;
+        }
+        if (!character_device_exists(params_device)) {
+            std::fprintf(stderr,
+                         "CAMERA_PREFLIGHT_ERROR camera_id=%d reason=params_device_missing path=%s\n",
                          camera_id,
-                         config->iq_dir[camera_id] != nullptr
-                             ? config->iq_dir[camera_id]
-                             : "(null)");
+                         params_device ? params_device : "(null)");
+            return CAMERA_BACKEND_ERR_IO;
+        }
+        if (sensor_device && sensor_device[0]) {
+            if (!character_device_exists(sensor_device)) {
+                std::fprintf(stderr,
+                             "CAMERA_PREFLIGHT_ERROR camera_id=%d reason=sensor_subdevice_missing path=%s\n",
+                             camera_id, sensor_device);
+                return CAMERA_BACKEND_ERR_IO;
+            }
+            for (int previous_id = 0; previous_id < camera_id; ++previous_id) {
+                const char *previous_device =
+                    config->sensor_device[previous_id];
+                if (same_character_device(sensor_device, previous_device)) {
+                    std::fprintf(
+                        stderr,
+                        "CAMERA_PREFLIGHT_ERROR camera_id=%d reason=sensor_subdevice_duplicate path=%s other_camera_id=%d other_path=%s\n",
+                        camera_id, sensor_device, previous_id,
+                        previous_device ? previous_device : "(null)");
+                    return CAMERA_BACKEND_ERR_ARGUMENT;
+                }
+            }
+            const std::string actual_name =
+                video4linux_device_name(sensor_device);
+            if (actual_name.empty() ||
+                (expected_sensor && expected_sensor[0] &&
+                 actual_name.find(expected_sensor) == std::string::npos)) {
+                std::fprintf(stderr,
+                             "CAMERA_PREFLIGHT_ERROR camera_id=%d reason=sensor_subdevice_mismatch path=%s expected=%s actual=%s\n",
+                             camera_id, sensor_device,
+                             expected_sensor ? expected_sensor : "(none)",
+                             actual_name.empty() ? "(unknown)"
+                                                 : actual_name.c_str());
+                return CAMERA_BACKEND_ERR_SENSOR_MISMATCH;
+            }
+        } else if (expected_sensor && expected_sensor[0]) {
+            uint32_t required = 0;
+            for (uint32_t index = 0; index < config->camera_count; ++index) {
+                const char *candidate = config->expected_sensor[index];
+                if (candidate && std::strcmp(candidate, expected_sensor) == 0)
+                    ++required;
+            }
+            const uint32_t available =
+                count_sensor_subdevices(expected_sensor);
+            if (available < required) {
+                std::fprintf(stderr,
+                             "CAMERA_PREFLIGHT_ERROR camera_id=%d reason=sensor_inventory_incomplete expected=%s required=%u available=%u\n",
+                             camera_id, expected_sensor, required, available);
+                return CAMERA_BACKEND_ERR_NOT_READY;
+            }
+        } else {
+            std::fprintf(stderr,
+                         "CAMERA_PREFLIGHT_ERROR camera_id=%d reason=sensor_identity_missing\n",
+                         camera_id);
             return CAMERA_BACKEND_ERR_IO;
         }
     }

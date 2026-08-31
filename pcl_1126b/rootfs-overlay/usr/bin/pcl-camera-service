@@ -81,9 +81,17 @@ set -- /usr/bin/camera_aiq_test \
 	--params0 "$params0" \
 	--subdev0 "$subdev0" \
 	--sensor0 imx586 \
-	--xdas-uart "${PCL_CAMERA_XDAS_UART:-/dev/ttyS2}" \
+	--gnss-uart "${PCL_CAMERA_GNSS_UART:-/dev/ttyS2}" \
+	--gnss-baud "${PCL_CAMERA_GNSS_BAUD:-115200}" \
+	--pps-device "${PCL_CAMERA_PPS_DEVICE:-/dev/pps0}" \
+	--gnss-rmc-delay-ms "${PCL_CAMERA_GNSS_RMC_DELAY_MS:-900}" \
 	--xdas-save-root "${PCL_CAMERA_SAVE_ROOT:-/userdata/camera}" \
 	--xdas-version "${PCL_CAMERA_VERSION:-DASCAM-RV1126B-00.01}"
+
+xdas_uart=${PCL_CAMERA_XDAS_UART-/dev/ttyS1}
+if [ -n "$xdas_uart" ]; then
+	set -- "$@" --xdas-uart "$xdas_uart"
+fi
 
 if [ "$camera_count" -eq 2 ]; then
 	video1=$(resolve_video "${PCL_CAMERA_VIDEO1:-auto}" rkisp_mainpath 1)
