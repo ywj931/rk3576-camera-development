@@ -1,0 +1,7 @@
+# build artifacts
+*.o
+camera_aiq_test
+camera_transfer_sender
+camera_transfer_protocol_test
+camera_aiq_test.dispatch-new
+# local UVC stubs were removed; build with UVC_ROOT=<real uvc source>

@@ -1,0 +1,3840 @@
+#include "camera_backend.h"
+#include "camera_control_uart.h"
+#include "camera_net_backend.h"
+#include "camera_photo_backend.h"
+#include "camera_uvc_backend.h"
+#include "capture_backend.h"
+#include "gnss_time_source.h"
+#include "imx586_v4l2_metadata.h"
+#include "photo_exif.h"
+#include "time_sync_service.h"
+#include "trigger_frame_binder.h"
+#include "trigger_simulator.h"
+#include "xdas_camera_protocol.h"
+#include "xdas_camera_service.h"
+#include "xvs_uart_controller.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <iostream>
+#include <limits>
+#include <linux/videodev2.h>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <sys/reboot.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <thread>
+#include <time.h>
+#include <unistd.h>
+
+namespace {
+
+volatile sig_atomic_t g_stop = 0;
+
+void signal_handler(int)
+{
+    g_stop = 1;
+}
+
+bool parse_u32(const std::string &text, uint32_t *value)
+{
+    if (value == nullptr || text.empty() || text[0] == '-')
+        return false;
+
+    errno = 0;
+    char *end = nullptr;
+    unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str() || *end != '\0' ||
+        parsed > UINT32_MAX) {
+        return false;
+    }
+    *value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool parse_i64(const std::string &text, int64_t *value)
+{
+    if (!value || text.empty())
+        return false;
+    errno = 0;
+    char *end = nullptr;
+    const long long parsed = std::strtoll(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str() || *end != '\0')
+        return false;
+    *value = static_cast<int64_t>(parsed);
+    return true;
+}
+
+bool parse_u64(const std::string &text, uint64_t *value)
+{
+    if (!value || text.empty() || text[0] == '-')
+        return false;
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+    if (errno || end == text.c_str() || *end != '\0')
+        return false;
+    *value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+uint64_t add_signed_ns(uint64_t base, int64_t offset)
+{
+    if (offset >= 0)
+        return base + static_cast<uint64_t>(offset);
+    const uint64_t magnitude = static_cast<uint64_t>(-(offset + 1)) + 1;
+    return base > magnitude ? base - magnitude : 0;
+}
+
+/* Lists other processes that currently hold an open fd for the given
+   device node, formatted as "pid(comm) pid(comm) ...".  A UART returns
+   ERR_BUSY when another process holds its flock, and any extra reader
+   (cat, minicom, a leftover camera_aiq_test, ...) silently steals bytes
+   from the daemon's reader.  Naming the openers turns both failure modes
+   from a generic "already in use" into an actionable diagnosis. */
+std::string list_device_openers(const std::string &device)
+{
+    if (device.empty())
+        return "";
+    struct stat device_stat = {};
+    if (stat(device.c_str(), &device_stat) != 0)
+        return "";
+
+    std::ostringstream result;
+    DIR *proc = opendir("/proc");
+    if (!proc)
+        return "";
+    const pid_t self = getpid();
+    int listed = 0;
+    struct dirent *pid_entry = nullptr;
+    while ((pid_entry = readdir(proc)) != nullptr && listed < 8) {
+        uint32_t pid_value = 0;
+        if (!parse_u32(pid_entry->d_name, &pid_value) ||
+            static_cast<pid_t>(pid_value) == self)
+            continue;
+        std::string fd_dir = std::string("/proc/") + pid_entry->d_name + "/fd";
+        DIR *fds = opendir(fd_dir.c_str());
+        if (!fds)
+            continue;
+        bool holds_device = false;
+        struct dirent *fd_entry = nullptr;
+        while ((fd_entry = readdir(fds)) != nullptr) {
+            if (fd_entry->d_name[0] == '.')
+                continue;
+            const std::string fd_path = fd_dir + "/" + fd_entry->d_name;
+            struct stat fd_stat = {};
+            if (stat(fd_path.c_str(), &fd_stat) != 0)
+                continue;
+            if (S_ISCHR(fd_stat.st_mode) &&
+                fd_stat.st_rdev == device_stat.st_rdev) {
+                holds_device = true;
+                break;
+            }
+        }
+        closedir(fds);
+        if (!holds_device)
+            continue;
+        char comm[64] = {};
+        const std::string comm_path =
+            std::string("/proc/") + pid_entry->d_name + "/comm";
+        if (FILE *comm_file = std::fopen(comm_path.c_str(), "r")) {
+            if (std::fgets(comm, sizeof(comm), comm_file)) {
+                comm[strcspn(comm, "\r\n")] = '\0';
+            }
+            std::fclose(comm_file);
+        }
+        if (listed > 0)
+            result << ' ';
+        result << pid_entry->d_name << '('
+               << (comm[0] ? comm : "?") << ')';
+        ++listed;
+    }
+    closedir(proc);
+    return result.str();
+}
+
+bool parse_camera_id(const std::string &text, int *camera_id)
+{
+    uint32_t parsed = 0;
+    if (!parse_u32(text, &parsed) ||
+        parsed >= CAMERA_BACKEND_CAMERA_COUNT) {
+        return false;
+    }
+    *camera_id = static_cast<int>(parsed);
+    return true;
+}
+
+bool filesystem_capacity_mb(std::string path, uint32_t *free_mb,
+                            uint32_t *total_mb)
+{
+    if (path.empty() || path[0] != '/' || !free_mb || !total_mb)
+        return false;
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+
+    struct statvfs information = {};
+    while (statvfs(path.c_str(), &information) < 0) {
+        if ((errno != ENOENT && errno != ENOTDIR) || path == "/")
+            return false;
+        const size_t separator = path.find_last_of('/');
+        path = separator == 0 ? "/" : path.substr(0, separator);
+    }
+
+    const uint64_t block_size = information.f_frsize
+                                    ? static_cast<uint64_t>(information.f_frsize)
+                                    : static_cast<uint64_t>(information.f_bsize);
+    const auto blocks_to_mb = [block_size](uint64_t blocks) {
+        const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+        const uint64_t bytes =
+            block_size && blocks > maximum / block_size
+                ? maximum
+                : blocks * block_size;
+        return static_cast<uint32_t>(std::min<uint64_t>(
+            bytes / (1024ULL * 1024ULL),
+            std::numeric_limits<uint32_t>::max()));
+    };
+    *free_mb = blocks_to_mb(static_cast<uint64_t>(information.f_bavail));
+    *total_mb = blocks_to_mb(static_cast<uint64_t>(information.f_blocks));
+    return true;
+}
+
+uint64_t realtime_us()
+{
+    struct timespec now = {};
+    if (clock_gettime(CLOCK_REALTIME, &now) < 0)
+        return 0;
+    return static_cast<uint64_t>(now.tv_sec) * 1000000ULL +
+           static_cast<uint64_t>(now.tv_nsec) / 1000ULL;
+}
+
+uint64_t monotonic_ns()
+{
+    struct timespec now = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return 0;
+    return static_cast<uint64_t>(now.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(now.tv_nsec);
+}
+
+void print_usage(const char *program)
+{
+    std::cout
+        << "Usage: " << program << " [options]\n"
+        << "  --width PIXELS      sensor width (default: 4000)\n"
+        << "  --height PIXELS     sensor height (default: 3000)\n"
+        << "  --camera-count 1|2  active camera count (default: 2)\n"
+        << "  --iq0 DIRECTORY     camera 0 IQ directory\n"
+        << "  --iq1 DIRECTORY     camera 1 IQ directory\n"
+        << "  --params0 DEVICE    camera 0 rkisp-input-params node\n"
+        << "  --params1 DEVICE    camera 1 rkisp-input-params node\n"
+        << "  --subdev0 DEVICE    optional camera 0 sensor subdevice override\n"
+        << "  --subdev1 DEVICE    optional camera 1 sensor subdevice override\n"
+        << "  --video0 DEVICE     camera 0 V4L2 capture node\n"
+        << "  --video1 DEVICE     camera 1 V4L2 capture node\n"
+        << "  --sensor0 TEXT      expected camera 0 sensor text\n"
+        << "  --sensor1 TEXT      expected camera 1 sensor text\n"
+        << "  --autostart         start capture and HTTP output for both cameras\n"
+        << "  --daemon            autostart both cameras and run without console input\n"
+        << "  --capture-daemon    start capture only and run without console input\n"
+        << "  --uvc-daemon        start both cameras and two UVC outputs without console input\n"
+        << "  --all-daemon        start capture, HTTP and two UVC outputs without console input\n"
+        << "  --uart DEVICE      unified camera control, XVS and time-event UART (recommended)\n"
+        << "  --control-uart DEVICE  legacy separate camera control UART\n"
+        << "  --control-uart-protocol-self-test  test control protocol without hardware\n"
+        << "  --xdas-uart DEVICE  xdas-compatible external camera control UART\n"
+        << "  --xdas-save-root DIR  JPEG/EXIF save root (default: /data/camera)\n"
+        << "  --xdas-stitch-host HOST  send global save as vertical composite JPEG\n"
+        << "  --xdas-stitch-port PORT  composite receiver port (default: 46000)\n"
+        << "  --xdas-version TEXT  version returned by xdas command 00 00\n"
+        << "  --xdas-protocol-self-test  test xdas framing and command mapping\n"
+        << "  --sync-uart DEVICE  legacy separate MCU XVS/time-event UART\n"
+        << "  --sync-timer-hz HZ  MCU high-resolution timer frequency (default: 1000000)\n"
+        << "  --gnss-uart DEVICE  direct GNSS GPRMC/GNRMC input UART\n"
+        << "  --gnss-baud BAUD    direct GNSS UART baud (default: 115200)\n"
+        << "  --pps-device DEVICE Linux PPS device (normally /dev/pps0)\n"
+        << "  --gnss-rmc-delay-ms MS  maximum RMC delay after PPS (default: 300)\n"
+        << "  --gnss-time-self-test  test direct GPRMC/PPS UTC mapping without hardware\n"
+        << "  --gnss-monitor       print direct GNSS/PPS lock status without opening cameras\n"
+        << "  --xvs-autostart-hz 4  start the shared 4 Hz XVS timebase after capture starts\n"
+        << "  --xvs-slave         force IMX586 XVS slave mode over i2c after streaming starts\n"
+        << "  --xvs-low-pulse-us US  autostart XVS low width (default: 10)\n"
+        << "  --sync-protocol-self-test  test XVS protocol without camera hardware\n"
+        << "  --sync-bind-self-test  test simulated trigger/frame binding without camera hardware\n"
+        << "  --photo-exif-self-test  test JPEG EXIF generation without camera hardware\n"
+        << "  UVC mode is 4000x3000 MJPEG; both cameras support 2 or 4 fps\n"
+        << "  network mode is fixed at 4000x3000 MJPEG 10 fps per camera, HTTP port 8080\n"
+        << "  --help              show this help\n";
+}
+
+void print_commands()
+{
+    std::cout
+        << "Commands:\n"
+        << "  status [all|0|1]\n"
+        << "  auto CAMERA_ID\n"
+        << "  exposure CAMERA_ID EXPOSURE_US\n"
+        << "  gain CAMERA_ID GAIN_X1000\n"
+        << "  iso CAMERA_ID ISO\n"
+        << "  fps CAMERA_ID FPS\n"
+        << "  stream-start CAMERA_ID|all\n"
+        << "  stream-stop CAMERA_ID|all\n"
+        << "  save-start CAMERA_ID OUTPUT_DIR\n"
+        << "  save-stop CAMERA_ID\n"
+        << "  photo-start CAMERA_ID OUTPUT_DIR\n"
+        << "  photo-stop CAMERA_ID\n"
+        << "  photo-status [all|0|1]\n"
+        << "  stitch-photo-start OUTPUT_DIR\n"
+        << "  stitch-photo-stop\n"
+        << "  stitch-photo-status\n"
+        << "  stitch-transfer-start OUTPUT_DIR HOST PORT\n"
+        << "  stitch-transfer-stop\n"
+        << "  stitch-transfer-status\n"
+        << "  photo-offset CAMERA_ID SENSOR_RESPONSE_OFFSET_NS\n"
+        << "  capture-status [all|0|1]\n"
+        << "  uvc-start CAMERA_ID|all\n"
+        << "  uvc-stop [CAMERA_ID|all]\n"
+        << "  uvc-status [CAMERA_ID|all]\n"
+        << "  net-start CAMERA_ID\n"
+        << "  net-stop [CAMERA_ID|all]\n"
+        << "  net-status [CAMERA_ID|all]\n"
+        << "  sync-idle\n"
+        << "  sync-start 2|4 [LOW_PULSE_US]\n"
+        << "  sync-count 2|4 PULSE_COUNT [LOW_PULSE_US]\n"
+        << "  sync-stop\n"
+        << "  sync-controller-status\n"
+        << "  time-sync-status\n"
+        << "  time-sync-reset\n"
+        << "  sync-bind-reset [PRE_SHUTTER_TRIGGERS]\n"
+        << "  sync-bind-log CSV_PATH|off\n"
+        << "  sync-bind-status\n"
+        << "  sync-bind-last\n"
+        << "  sync-sim-start 2|4 [PULSE_COUNT]\n"
+        << "  sync-sim-stop\n"
+        << "  sync-sim-status\n"
+        << "  sync-status\n"
+        << "  wait MILLISECONDS\n"
+        << "  help\n"
+        << "  quit\n";
+}
+
+void print_status(camera_backend_t *backend, int camera_id)
+{
+    camera_backend_status_t status = {};
+    int result = camera_backend_get_status(backend, camera_id, &status);
+    if (result != CAMERA_BACKEND_OK) {
+        std::cout << "ERROR command=status camera_id=" << camera_id
+                  << " code=" << result
+                  << " reason=\"" << camera_backend_strerror(result) << "\"\n";
+        return;
+    }
+
+    std::cout << "STATUS camera_id=" << status.camera_id
+              << " online=" << status.online
+              << " started=" << status.started
+              << " mode=" << (status.manual_mode ? "MANUAL" : "AUTO")
+              << " query_valid=" << status.query_valid
+              << " sensor_controls_valid=" << status.sensor_controls_valid
+              << " exposure_us=" << status.exposure_us
+              << " gain_x1000=" << status.gain_x1000
+              << " digital_gain_x1000=" << status.digital_gain_x1000
+              << " isp_dgain_x1000=" << status.isp_dgain_x1000
+              << " iso=" << status.iso
+              << " aiq_iso=" << status.aiq_iso
+              << " iso_estimated=" << status.iso_estimated
+              << " white_balance_valid=" << status.white_balance_valid
+              << " white_balance_auto=" << status.white_balance_auto
+              << " white_balance_converged="
+              << status.white_balance_converged
+              << " white_balance_cct=" << status.white_balance_cct
+              << " wb_r_gain_x1000=" << status.wb_r_gain_x1000
+              << " wb_gr_gain_x1000=" << status.wb_gr_gain_x1000
+              << " wb_gb_gain_x1000=" << status.wb_gb_gain_x1000
+              << " wb_b_gain_x1000=" << status.wb_b_gain_x1000
+              << " fps_x1000=" << status.fps_x1000
+              << " requested_exposure_us="
+              << status.requested_exposure_us
+              << " requested_gain_x1000="
+              << status.requested_gain_x1000
+              << " requested_iso=" << status.requested_iso
+              << " requested_fps_x1000="
+              << status.requested_fps_x1000
+              << " xvs_config_valid=" << status.xvs_config_valid
+              << " xvs_input_thin=" << status.xvs_input_thin
+              << " manual_settings_verified="
+              << status.manual_settings_verified
+              << " manual_settings_pending="
+              << status.manual_settings_pending
+              << " mean_luma=" << status.mean_luma
+              << " converged=" << status.converged
+              << " last_aiq_error=" << status.last_aiq_error
+              << " sensor=\"" << status.sensor_name << "\""
+              << " sensor_device=\"" << status.sensor_device << "\""
+              << " iq=\"" << status.iq_dir << "\"\n";
+}
+
+void print_capture_status(capture_backend_t *capture, int camera_id)
+{
+    capture_backend_status_t status = {};
+    int result = capture_backend_get_status(capture, camera_id, &status);
+    if (result != CAPTURE_BACKEND_OK) {
+        std::cout << "ERROR command=capture-status camera_id=" << camera_id
+                  << " code=" << result
+                  << " reason=\"" << capture_backend_strerror(result)
+                  << "\"\n";
+        return;
+    }
+
+    std::cout << "CAPTURE_STATUS camera_id=" << status.camera_id
+              << " running=" << status.running
+              << " saving=" << status.saving
+              << " size=" << status.width << 'x' << status.height
+              << " fps_x1000=" << status.fps_x1000
+              << " fps_target_x1000=" << status.fps_target_x1000
+              << " fps_stable=" << status.fps_stable
+              << " fps_window_frames=" << status.fps_window_frames
+              << " fps_window_duration_ns="
+              << status.fps_window_duration_ns
+              << " frames=" << status.frames_captured
+              << " sequence_drops=" << status.frames_dropped
+              << " saved=" << status.frames_saved
+              << " save_queue_pending=" << status.save_queue_pending
+              << " save_queue_drops=" << status.save_queue_dropped
+              << " save_failures=" << status.save_failures
+              << " bytes_saved=" << status.bytes_saved
+              << " timestamp_valid=" << status.timestamp_valid
+              << " last_sequence=" << status.last_sequence
+              << " buffer_flags=0x" << std::hex << status.last_buffer_flags
+              << std::dec
+              << " v4l2_timestamp_ns=" << status.last_v4l2_timestamp_ns
+              << " realtime_dequeue_ns=" << status.last_realtime_dequeue_ns
+              << " last_errno=" << status.last_errno
+              << " device=\"" << status.video_device << "\""
+              << " output_dir=\"" << status.output_dir << "\""
+              << " metadata=\"" << status.metadata_path << "\""
+              << " last_file=\"" << status.last_saved_path << "\"\n";
+}
+
+void print_sync_status(capture_backend_t *capture)
+{
+    capture_backend_sync_status_t status = {};
+    int result = capture_backend_get_sync_status(capture, &status);
+    if (result != CAPTURE_BACKEND_OK) {
+        std::cout << "ERROR command=sync-status code=" << result
+                  << " reason=\"" << capture_backend_strerror(result)
+                  << "\"\n";
+        return;
+    }
+    std::cout << "SYNC_STATUS valid=" << status.valid
+              << " method=nearest_v4l2_monotonic_timestamp"
+              << " diagnostic_only=1"
+              << " cam0_sequence=" << status.cam0_sequence
+              << " cam1_sequence=" << status.cam1_sequence
+              << " cam0_flags=0x" << std::hex << status.cam0_buffer_flags
+              << " cam1_flags=0x" << status.cam1_buffer_flags << std::dec
+              << " cam0_timestamp_ns=" << status.cam0_timestamp_ns
+              << " cam1_timestamp_ns=" << status.cam1_timestamp_ns
+              << " delta_ns=" << status.delta_ns << '\n';
+}
+
+void print_xvs_controller_status(xvs_uart_controller_t *controller)
+{
+    if (!controller) {
+        std::cout << "XVS_CONTROLLER_STATUS configured=0 connected=0\n";
+        return;
+    }
+
+    xvs_uart_status_t status = {};
+    const int result = xvs_uart_get_status(controller, &status);
+    if (result != XVS_UART_OK) {
+        std::cout << "ERROR command=sync-controller-status code=" << result
+                  << " reason=\"" << xvs_uart_strerror(result) << "\"\n";
+        return;
+    }
+    std::cout << "XVS_CONTROLLER_STATUS configured=1"
+              << " connected=" << status.connected
+              << " valid=" << status.valid
+              << " state=" << status.state
+              << " frequency_millihz=" << status.frequency_millihz
+              << " low_pulse_us=" << status.low_pulse_us
+              << " pulse_count=" << status.pulse_count
+              << " last_trigger_id=" << status.last_trigger_id
+              << " device=\"" << status.device << "\"\n";
+}
+
+void print_time_sync_status(time_sync_service_t *time_sync,
+                            gnss_time_source_t *gnss_time)
+{
+    time_sync_status_t status = {};
+    const int result = time_sync_get_status(time_sync, &status);
+    if (result != TIME_SYNC_OK) {
+        std::cout << "ERROR command=time-sync-status code=" << result
+                  << " reason=\"" << time_sync_strerror(result) << "\"\n";
+        return;
+    }
+    std::cout << "TIME_SYNC_STATUS state="
+              << time_sync_state_name(status.state)
+              << " utc_valid=" << status.utc_valid
+              << " timer_frequency_hz=" << status.timer_frequency_hz
+              << " holdover_age_pps=" << status.holdover_age_pps
+              << " max_holdover_pps=" << status.max_holdover_pps
+              << " pps_events=" << status.pps_events
+              << " rmc_events=" << status.rmc_events
+              << " invalid_rmc_events=" << status.invalid_rmc_events
+              << " resolved_events=" << status.resolved_events
+              << " unresolved_events=" << status.unresolved_events
+              << " last_pps_id=" << status.last_pps_id
+              << " last_pps_tick=" << status.last_pps_tick
+              << " last_rmc_pps_id=" << status.last_rmc_pps_id
+              << " last_rmc_utc_sec=" << status.last_rmc_utc_sec
+              << " reference_utc_ns=" << status.reference_utc_ns
+              << " source=" << (gnss_time ? "DIRECT_GNSS" : "MCU_UART")
+              << '\n';
+    if (!gnss_time)
+        return;
+    gnss_time_source_status_t gnss = {};
+    const int gnss_result = gnss_time_source_get_status(gnss_time, &gnss);
+    if (gnss_result != GNSS_TIME_OK) {
+        std::cout << "GNSS_TIME_STATUS error=" << gnss_result << '\n';
+        return;
+    }
+    std::cout << "GNSS_TIME_STATUS running=" << gnss.running
+              << " uart_connected=" << gnss.uart_connected
+              << " pps_connected=" << gnss.pps_connected
+              << " uart=\"" << gnss.uart_device << "\""
+              << " baud=" << gnss.uart_baud
+              << " pps_device=\"" << gnss.pps_device << "\""
+              << " pps_events=" << gnss.pps_events
+              << " rmc_events=" << gnss.rmc_events
+              << " invalid_rmc=" << gnss.invalid_rmc_events
+              << " unpaired_rmc=" << gnss.unpaired_rmc_events
+              << " last_pps_id=" << gnss.last_pps_id
+              << " kernel_pps_sequence=" << gnss.last_kernel_pps_sequence
+              << " last_pps_monotonic_ns="
+              << gnss.last_pps_monotonic_ns
+              << " clock_sample_span_ns=" << gnss.last_clock_sample_span_ns
+              << " uart_open_errors=" << gnss.uart_open_errors
+              << " pps_open_errors=" << gnss.pps_open_errors
+              << " pps_fetch_errors=" << gnss.pps_fetch_errors
+              << " mapping_errors=" << gnss.time_mapping_errors
+              << " last_error=" << gnss.last_error
+              << " last_errno=" << gnss.last_errno << '\n';
+}
+
+void print_trigger_binding_status(trigger_frame_binder_t *binder)
+{
+    trigger_frame_binder_status_t status = {};
+    const int result = trigger_frame_binder_get_status(binder, &status);
+    if (result != TRIGGER_FRAME_BINDER_OK) {
+        std::cout << "ERROR command=sync-bind-status code=" << result
+                  << " reason=\"" << trigger_frame_binder_strerror(result)
+                  << "\"\n";
+        return;
+    }
+    std::cout << "TRIGGER_BIND_STATUS triggers=" << status.triggers_received
+              << " ignored=" << status.triggers_ignored
+              << " trigger_id_gaps=" << status.trigger_id_gaps
+              << " duplicate_triggers=" << status.duplicate_triggers
+              << " pending=" << status.pending_triggers
+              << " pending_overflows="
+              << status.pending_trigger_overflows
+              << " cam0_frames=" << status.frames_received[0]
+              << " cam0_bound=" << status.frames_bound[0]
+              << " cam0_without_trigger="
+              << status.frames_without_trigger[0]
+              << " cam1_frames=" << status.frames_received[1]
+              << " cam1_bound=" << status.frames_bound[1]
+              << " cam1_without_trigger="
+              << status.frames_without_trigger[1]
+              << " complete_pairs=" << status.complete_pairs
+              << " last_trigger_id=" << status.last_trigger_id
+              << " last_completed_trigger_id="
+              << status.last_completed_trigger_id
+              << " last_frame_delta_ns=" << status.last_frame_delta_ns
+              << " csv=\"" << status.csv_path << "\"\n";
+}
+
+void print_trigger_binding_last(trigger_frame_binder_t *binder)
+{
+    trigger_frame_binding_t binding = {};
+    const int result = trigger_frame_binder_get_last_binding(binder, &binding);
+    if (result != TRIGGER_FRAME_BINDER_OK) {
+        std::cout << "ERROR command=sync-bind-last code=" << result
+                  << " reason=\"" << trigger_frame_binder_strerror(result)
+                  << "\"\n";
+        return;
+    }
+    if (!binding.valid) {
+        std::cout << "TRIGGER_BIND_LAST valid=0\n";
+        return;
+    }
+    std::cout << "TRIGGER_BIND_LAST valid=1 trigger_id="
+              << binding.trigger_id << " source=" << binding.source
+              << " trigger_monotonic_ns=" << binding.trigger_monotonic_ns
+              << " trigger_realtime_ns=" << binding.trigger_realtime_ns
+              << " pps_id=" << binding.pps_id
+              << " trigger_timer_tick=" << binding.trigger_timer_tick
+              << " utc_valid=" << binding.utc_valid
+              << " monotonic_is_uart_arrival="
+              << binding.monotonic_is_uart_arrival
+              << " cam0_sequence=" << binding.cam0_sequence
+              << " cam0_timestamp_ns=" << binding.cam0_timestamp_ns
+              << " cam0_delay_ns=" << binding.cam0_delay_ns
+              << " cam1_sequence=" << binding.cam1_sequence
+              << " cam1_timestamp_ns=" << binding.cam1_timestamp_ns
+              << " cam1_delay_ns=" << binding.cam1_delay_ns
+              << " frame_delta_ns=" << binding.frame_delta_ns << '\n';
+}
+
+void print_trigger_simulator_status(trigger_simulator_t *simulator)
+{
+    trigger_simulator_status_t status = {};
+    const int result = trigger_simulator_get_status(simulator, &status);
+    if (result != TRIGGER_SIMULATOR_OK) {
+        std::cout << "ERROR command=sync-sim-status code=" << result
+                  << " reason=\"" << trigger_simulator_strerror(result)
+                  << "\"\n";
+        return;
+    }
+    std::cout << "SYNC_SIMULATOR_STATUS running=" << status.running
+              << " physical_xvs=0 frequency_hz=" << status.frequency_hz
+              << " requested_pulses=" << status.requested_count
+              << " emitted_triggers=" << status.emitted_count
+              << " last_trigger_id=" << status.last_trigger_id << '\n';
+}
+
+void capture_to_trigger_binder(int camera_id, uint32_t sequence,
+                               uint32_t buffer_flags,
+                               uint64_t v4l2_timestamp_ns,
+                               uint64_t realtime_dequeue_ns,
+                               void *user_data)
+{
+    auto *binder = static_cast<trigger_frame_binder_t *>(user_data);
+    const trigger_frame_event_t frame = {
+        camera_id, sequence, buffer_flags, v4l2_timestamp_ns,
+        realtime_dequeue_ns,
+    };
+    const int result = trigger_frame_binder_on_frame(binder, &frame);
+    if (result != TRIGGER_FRAME_BINDER_OK) {
+        std::cerr << "TRIGGER_BIND_FRAME_ERROR camera_id=" << camera_id
+                  << " code=" << result << " reason=\""
+                  << trigger_frame_binder_strerror(result) << "\"\n";
+    }
+}
+
+void simulator_to_trigger_binder(uint64_t trigger_id, uint64_t monotonic_ns,
+                                 uint64_t realtime_ns, void *user_data)
+{
+    auto *binder = static_cast<trigger_frame_binder_t *>(user_data);
+    const int result = trigger_frame_binder_on_trigger(
+        binder, trigger_id, monotonic_ns, realtime_ns, "SIM");
+    if (result != TRIGGER_FRAME_BINDER_OK) {
+        std::cerr << "TRIGGER_BIND_SIM_ERROR trigger_id=" << trigger_id
+                  << " code=" << result << " reason=\""
+                  << trigger_frame_binder_strerror(result) << "\"\n";
+    }
+}
+
+struct xvs_event_context {
+    time_sync_service_t *time_sync = nullptr;
+    gnss_time_source_t *gnss_time = nullptr;
+    trigger_frame_binder_t *binder = nullptr;
+    std::atomic<uint64_t> event_errors{0};
+};
+
+void xvs_event_to_time_and_frame(const xvs_uart_event_t *event,
+                                 void *user_data)
+{
+    auto *context = static_cast<xvs_event_context *>(user_data);
+    if (!event || !context || !context->time_sync || !context->binder)
+        return;
+
+    int result = TIME_SYNC_OK;
+    if (event->type == XVS_UART_EVENT_PPS && !context->gnss_time) {
+        result = time_sync_on_pps(context->time_sync, event->pps_id,
+                                  event->timer_tick);
+    } else if (event->type == XVS_UART_EVENT_RMC && !context->gnss_time) {
+        result = time_sync_on_rmc_utc(context->time_sync, event->pps_id,
+                                      event->utc_sec, event->valid);
+    } else if (event->type == XVS_UART_EVENT_NMEA && !context->gnss_time) {
+        result = time_sync_on_nmea_rmc(context->time_sync, event->pps_id,
+                                       event->nmea);
+    } else if (event->type == XVS_UART_EVENT_XVS) {
+        time_sync_resolution_t resolution = {};
+        const int resolve_result = context->gnss_time
+                                       ? gnss_time_source_resolve_monotonic_ns(
+                                             context->gnss_time,
+                                             event->uart_receive_monotonic_ns,
+                                             &resolution)
+                                       : time_sync_resolve_tick(
+                                             context->time_sync, event->pps_id,
+                                             event->timer_tick, &resolution);
+        trigger_frame_trigger_t trigger = {};
+        trigger.trigger_id = event->trigger_id;
+        trigger.monotonic_ns = event->uart_receive_monotonic_ns;
+        trigger.realtime_ns =
+            resolve_result == TIME_SYNC_OK && resolution.valid
+                ? resolution.utc_ns
+                : event->uart_receive_realtime_ns;
+        trigger.pps_id = context->gnss_time && resolution.valid
+                             ? resolution.pps_id
+                             : event->pps_id;
+        trigger.timer_tick = event->timer_tick;
+        trigger.utc_valid =
+            resolve_result == TIME_SYNC_OK && resolution.valid ? 1 : 0;
+        trigger.monotonic_is_uart_arrival = 1;
+        trigger.source =
+            trigger.utc_valid
+                ? (context->gnss_time
+                       ? (resolution.state == TIME_SYNC_STATE_HOLDOVER
+                              ? "GNSS_PPS_HOLDOVER_UART_ARRIVAL"
+                              : "GNSS_PPS_LOCKED_UART_ARRIVAL")
+                       : (resolution.state == TIME_SYNC_STATE_HOLDOVER
+                              ? "MCU_PPS_HOLDOVER"
+                              : "MCU_PPS_LOCKED"))
+                : (context->gnss_time ? "GNSS_PPS_UNLOCKED_UART_ARRIVAL"
+                                      : "MCU_PPS_UNLOCKED");
+        result = trigger_frame_binder_on_trigger_ex(context->binder,
+                                                     &trigger);
+    }
+    if (result != 0) {
+        ++context->event_errors;
+        std::cerr << "XVS_EVENT_ERROR type=" << event->type
+                  << " pps_id=" << event->pps_id
+                  << " trigger_id=" << event->trigger_id
+                  << " code=" << result << '\n';
+    }
+}
+
+struct trigger_binding_self_test_context {
+    trigger_frame_binder_t *binder = nullptr;
+    std::atomic<int> callback_error{0};
+};
+
+void simulated_trigger_self_test(uint64_t trigger_id, uint64_t monotonic_ns,
+                                 uint64_t realtime_ns, void *user_data)
+{
+    auto *context = static_cast<trigger_binding_self_test_context *>(user_data);
+    int result = trigger_frame_binder_on_trigger(
+        context->binder, trigger_id, monotonic_ns, realtime_ns, "SIM");
+    if (result == TRIGGER_FRAME_BINDER_OK) {
+        const trigger_frame_event_t cam1 = {
+            1, static_cast<uint32_t>(100 + trigger_id), 0x2001,
+            monotonic_ns + 1200000ULL, realtime_ns + 1200000ULL,
+        };
+        const trigger_frame_event_t cam0 = {
+            0, static_cast<uint32_t>(200 + trigger_id), 0x2001,
+            monotonic_ns + 1000000ULL, realtime_ns + 1000000ULL,
+        };
+        result = trigger_frame_binder_on_frame(context->binder, &cam1);
+        if (result == TRIGGER_FRAME_BINDER_OK)
+            result = trigger_frame_binder_on_frame(context->binder, &cam0);
+    }
+    if (result != TRIGGER_FRAME_BINDER_OK)
+        context->callback_error.store(result);
+}
+
+bool run_trigger_binding_self_test()
+{
+    trigger_frame_binder_t *binder = nullptr;
+    trigger_simulator_t *simulator = nullptr;
+    trigger_frame_binder_config_t config = {};
+    trigger_frame_binder_default_config(&config);
+    config.max_pending_triggers = 8;
+    config.completed_history_depth = 8;
+    int result = trigger_frame_binder_create(&config, &binder);
+    if (result != TRIGGER_FRAME_BINDER_OK) {
+        std::cerr << "SYNC_BIND_SELF_TEST_FAILED stage=binder-create code="
+                  << result << '\n';
+        return false;
+    }
+    trigger_binding_self_test_context context = {binder};
+    result = trigger_simulator_create(simulated_trigger_self_test, &context,
+                                      &simulator);
+    if (result != TRIGGER_SIMULATOR_OK) {
+        std::cerr << "SYNC_BIND_SELF_TEST_FAILED stage=simulator-create code="
+                  << result << '\n';
+        trigger_frame_binder_destroy(binder);
+        return false;
+    }
+    result = trigger_simulator_start(simulator, 2, 2);
+    if (result == TRIGGER_SIMULATOR_OK) {
+        for (int attempt = 0; attempt < 60; ++attempt) {
+            trigger_simulator_status_t status = {};
+            trigger_simulator_get_status(simulator, &status);
+            if (!status.running && status.emitted_count == 2)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    trigger_simulator_stop(simulator);
+
+    trigger_simulator_status_t simulator_status = {};
+    trigger_frame_binder_status_t binder_status = {};
+    trigger_frame_binding_t last = {};
+    const bool passed =
+        result == TRIGGER_SIMULATOR_OK && context.callback_error.load() == 0 &&
+        trigger_simulator_get_status(simulator, &simulator_status) ==
+            TRIGGER_SIMULATOR_OK &&
+        trigger_frame_binder_get_status(binder, &binder_status) ==
+            TRIGGER_FRAME_BINDER_OK &&
+        trigger_frame_binder_get_last_binding(binder, &last) ==
+            TRIGGER_FRAME_BINDER_OK &&
+        simulator_status.emitted_count == 2 && binder_status.triggers_received == 2 &&
+        binder_status.complete_pairs == 2 && binder_status.frames_bound[0] == 2 &&
+        binder_status.frames_bound[1] == 2 && last.valid && last.trigger_id == 2 &&
+        last.cam0_sequence == 202 && last.cam1_sequence == 102 &&
+        last.frame_delta_ns == 200000;
+    trigger_simulator_destroy(simulator);
+    trigger_frame_binder_destroy(binder);
+    if (!passed) {
+        std::cerr << "SYNC_BIND_SELF_TEST_FAILED emitted="
+                  << simulator_status.emitted_count << " triggers="
+                  << binder_status.triggers_received << " pairs="
+                  << binder_status.complete_pairs << " callback_error="
+                  << context.callback_error.load() << '\n';
+        return false;
+    }
+    std::cout << "SYNC_BIND_SELF_TEST_OK source=SIM triggers=2 pairs=2 "
+                 "frame_delta_ns=200000\n";
+    return true;
+}
+
+bool both_capture_streams_running(capture_backend_t *capture)
+{
+    for (int camera_id = 0; camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+         ++camera_id) {
+        capture_backend_status_t status = {};
+        if (capture_backend_get_status(capture, camera_id, &status) !=
+                CAPTURE_BACKEND_OK ||
+            !status.running) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void print_xvs_result(const char *command, int result)
+{
+    if (result == XVS_UART_OK) {
+        std::cout << "OK command=" << command << '\n';
+    } else {
+        std::cout << "ERROR command=" << command << " code=" << result
+                  << " reason=\"" << xvs_uart_strerror(result) << "\"\n";
+    }
+}
+
+bool require_xvs_controller(const char *command,
+                            xvs_uart_controller_t *controller)
+{
+    if (controller)
+        return true;
+    std::cout << "ERROR command=" << command
+              << " reason=\"XVS MCU UART is not configured; restart with "
+                 "--sync-uart DEVICE\"\n";
+    return false;
+}
+
+void print_uvc_status(camera_uvc_backend_t *uvc, int camera_id)
+{
+    camera_uvc_status_t status = {};
+    int result = camera_uvc_get_status(uvc, camera_id, &status);
+    if (result != CAMERA_UVC_OK) {
+        std::cout << "ERROR command=uvc-status camera_id=" << camera_id
+                  << " code=" << result
+                  << " reason=\"" << camera_uvc_strerror(result) << "\"\n";
+        return;
+    }
+
+    char fcc[5] = {
+        static_cast<char>(status.negotiated_fcc & 0xff),
+        static_cast<char>((status.negotiated_fcc >> 8) & 0xff),
+        static_cast<char>((status.negotiated_fcc >> 16) & 0xff),
+        static_cast<char>((status.negotiated_fcc >> 24) & 0xff),
+        '\0'};
+    std::cout << "UVC_STATUS camera_id=" << camera_id
+              << " enabled=" << status.enabled
+              << " host_streaming=" << status.host_streaming
+              << " source_camera_id=" << status.source_camera_id
+              << " configured=" << status.width << 'x' << status.height
+              << '@' << status.fps << "fps/MJPEG"
+              << " negotiated=" << status.negotiated_width << 'x'
+              << status.negotiated_height << '@' << status.negotiated_fps
+              << "fps/" << (status.negotiated_fcc ? fcc : "none")
+              << " submitted=" << status.frames_submitted
+              << " encoded=" << status.frames_encoded
+              << " sent=" << status.frames_sent
+              << " skipped_no_host=" << status.frames_skipped_no_host
+              << " rate_limited=" << status.frames_rate_limited
+              << " queue_pending=" << status.queue_pending
+              << " queue_drops=" << status.queue_drops
+              << " encode_errors=" << status.encode_errors
+              << " jpeg_bytes=" << status.jpeg_bytes
+              << " invalid_jpeg=" << status.invalid_jpeg
+              << " stale_frames=" << status.stale_frames
+              << " first_sent_sequence="
+              << (status.first_sent_sequence_valid
+                      ? std::to_string(status.first_sent_sequence)
+                      : "none")
+              << " last_sequence=" << status.last_sequence
+              << " last_error=" << status.last_error
+              << " last_mpp_error=" << status.last_mpp_error << '\n';
+}
+
+void print_net_status(camera_net_backend_t *net, int camera_id)
+{
+    camera_net_status_t status = {};
+    int result = camera_net_get_camera_status(net, camera_id, &status);
+    if (result != CAMERA_NET_OK) {
+        std::cout << "ERROR command=net-status camera_id=" << camera_id
+                  << " code=" << result
+                  << " reason=\"" << camera_net_strerror(result) << "\"\n";
+        return;
+    }
+    std::cout << "NET_STATUS camera_id=" << status.camera_id
+              << " enabled=" << status.enabled
+              << " server_running=" << status.server_running
+              << " source_camera_id=" << status.source_camera_id
+              << " configured=" << status.width << 'x' << status.height
+              << '@' << status.fps << "fps/MJPEG"
+              << " jpeg_quality=" << status.jpeg_quality
+              << " port=" << status.port
+              << " path=" << status.path
+              << " clients=" << status.connected_clients
+              << " submitted=" << status.frames_submitted
+              << " encoded=" << status.frames_encoded
+              << " sent=" << status.frames_sent
+              << " queue_pending=" << status.queue_pending
+              << " queue_drops=" << status.queue_drops
+              << " encode_errors=" << status.encode_errors
+              << " client_disconnects=" << status.client_disconnects
+              << " http_errors=" << status.http_errors
+              << " jpeg_bytes=" << status.jpeg_bytes
+              << " last_sequence=" << status.last_sequence
+              << " last_error=" << status.last_error
+              << " last_mpp_error=" << status.last_mpp_error
+              << " last_socket_errno=" << status.last_socket_errno << '\n';
+}
+
+void print_photo_status(camera_photo_backend_t *photo, int camera_id)
+{
+    camera_photo_status_t status = {};
+    const int result = camera_photo_get_status(photo, camera_id, &status);
+    if (result != CAMERA_PHOTO_OK) {
+        std::cout << "ERROR command=photo-status camera_id=" << camera_id
+                  << " code=" << result << " reason=\""
+                  << camera_photo_strerror(result) << "\"\n";
+        return;
+    }
+    std::cout
+        << "PHOTO_STATUS camera_id=" << status.camera_id
+        << " enabled=" << status.enabled
+        << " processing=" << status.processing
+        << " size=" << status.width << 'x' << status.height
+        << " quality=" << status.jpeg_quality
+        << " response_offset_ns=" << status.sensor_response_offset_ns
+        << " submitted=" << status.frames_submitted
+        << " saved=" << status.photos_saved
+        << " queue_pending=" << status.queue_pending
+        << " queue_drops=" << status.queue_drops
+        << " unbound_frames=" << status.frames_without_trigger
+        << " invalid_metadata=" << status.invalid_metadata
+        << " encode_errors=" << status.encode_errors
+        << " exif_errors=" << status.exif_errors
+        << " write_errors=" << status.write_errors
+        << " jpeg_bytes=" << status.jpeg_bytes
+        << " last_frame_id=" << status.last_frame_id
+        << " last_trigger_id=" << status.last_trigger_id
+        << " last_error=" << status.last_error
+        << " last_mpp_error=" << status.last_mpp_error
+        << " last_errno=" << status.last_errno
+        << " output_dir=\"" << status.output_dir << "\""
+        << " metadata_csv=\"" << status.metadata_csv << "\""
+        << " last_photo=\"" << status.last_photo << "\"\n";
+}
+
+void print_stitch_photo_status(camera_photo_backend_t *photo)
+{
+    camera_photo_stitch_status_t status = {};
+    const int result = camera_photo_stitch_get_status(photo, &status);
+    if (result != CAMERA_PHOTO_OK) {
+        std::cout << "ERROR command=stitch-photo-status code=" << result
+                  << " reason=\"" << camera_photo_strerror(result) << "\"\n";
+        return;
+    }
+    std::cout
+        << "STITCH_PHOTO_STATUS enabled=" << status.enabled
+        << " processing=" << status.processing
+        << " assembling=" << status.assembling
+        << " size=" << status.width << 'x' << status.height
+        << " quality=" << status.jpeg_quality
+        << " submitted_cam0=" << status.frames_submitted_cam0
+        << " submitted_cam1=" << status.frames_submitted_cam1
+        << " paired=" << status.pairs_matched
+        << " saved=" << status.photos_saved
+        << " pending_cam0=" << status.pending_cam0
+        << " pending_cam1=" << status.pending_cam1
+        << " queue_pending=" << status.queue_pending
+        << " unmatched_drops_cam0=" << status.unmatched_drops_cam0
+        << " unmatched_drops_cam1=" << status.unmatched_drops_cam1
+        << " queue_drops=" << status.queue_drops
+        << " invalid_metadata=" << status.invalid_metadata
+        << " encode_errors=" << status.encode_errors
+        << " exif_errors=" << status.exif_errors
+        << " write_errors=" << status.write_errors
+        << " jpeg_bytes=" << status.jpeg_bytes
+        << " last_pair_id=" << status.last_pair_id
+        << " last_top_frame_id=" << status.last_top_frame_id
+        << " last_bottom_frame_id=" << status.last_bottom_frame_id
+        << " last_frame_delta_ns=" << status.last_frame_delta_ns
+        << " last_composite_capture_realtime_ns="
+        << status.last_composite_capture_realtime_ns
+        << " last_composite_utc_valid=" << status.last_composite_utc_valid
+        << " last_top_frame_realtime_ns="
+        << status.last_top_frame_realtime_ns
+        << " last_bottom_frame_realtime_ns="
+        << status.last_bottom_frame_realtime_ns
+        << " last_top_exposure_us=" << status.last_top_exposure_us
+        << " last_bottom_exposure_us=" << status.last_bottom_exposure_us
+        << " last_top_iso=" << status.last_top_iso
+        << " last_bottom_iso=" << status.last_bottom_iso
+        << " last_error=" << status.last_error
+        << " last_mpp_error=" << status.last_mpp_error
+        << " last_errno=" << status.last_errno
+        << " output_dir=\"" << status.output_dir << "\""
+        << " metadata_csv=\"" << status.metadata_csv << "\""
+        << " last_photo=\"" << status.last_photo << "\"\n";
+}
+
+void print_stitch_transfer_status(camera_photo_backend_t *photo)
+{
+    camera_photo_stitch_transfer_status_t status = {};
+    const int result =
+        camera_photo_stitch_transfer_get_status(photo, &status);
+    if (result != CAMERA_PHOTO_OK) {
+        std::cout << "ERROR command=stitch-transfer-status code=" << result
+                  << " reason=\"" << camera_photo_strerror(result) << "\"\n";
+        return;
+    }
+    std::cout
+        << "STITCH_TRANSFER_STATUS enabled=" << status.enabled
+        << " processing=" << status.processing
+        << " host=\"" << status.host << "\""
+        << " port=" << status.port
+        << " session=" << status.session_id
+        << " enqueued=" << status.enqueued
+        << " delivered=" << status.delivered
+        << " retries=" << status.retries
+        << " failed=" << status.failed
+        << " queue_rejected=" << status.queue_rejected
+        << " delete_errors=" << status.delete_errors
+        << " queue_pending=" << status.queue_pending
+        << " backlog=" << status.backlog
+        << " backlog_peak=" << status.backlog_peak
+        << " deferred=" << status.deferred
+        << " recovered=" << status.recovered
+        << " spool_recovered=" << status.spool_recovered
+        << " orphan_recovered=" << status.orphan_recovered
+        << " orphan_unrecoverable=" << status.orphan_unrecoverable
+        << " spool_recovery_errors=" << status.spool_recovery_errors
+        << " bytes=" << status.bytes
+        << " last_result=" << status.last_result
+        << " last_errno=" << status.last_errno
+        << " last_error=\"" << status.last_error << "\""
+        << " last_path=\"" << status.last_path << "\"\n";
+}
+
+struct output_backends {
+    camera_uvc_backend_t *uvc = nullptr;
+    camera_net_backend_t *net = nullptr;
+    camera_backend_t *camera = nullptr;
+    capture_backend_t *capture = nullptr;
+    trigger_frame_binder_t *binder = nullptr;
+    camera_photo_backend_t *photo = nullptr;
+    gnss_time_source_t *gnss_time = nullptr;
+};
+
+void capture_to_outputs(int camera_id, const void *plane0, size_t plane0_size,
+                        const void *plane1, size_t plane1_size,
+                        uint32_t sequence, void *user_data)
+{
+    output_backends *outputs = static_cast<output_backends *>(user_data);
+    if (outputs->uvc) {
+        camera_uvc_submit_nv12(outputs->uvc, camera_id, plane0, plane0_size,
+                               plane1, plane1_size, sequence);
+    }
+    if (outputs->net) {
+        camera_net_submit_nv12(outputs->net, camera_id, plane0, plane0_size,
+                               plane1, plane1_size, sequence);
+    }
+    if (!outputs->photo || !outputs->binder || !outputs->camera ||
+        !outputs->capture)
+        return;
+    const bool individual_photo_enabled =
+        camera_photo_is_enabled(outputs->photo, camera_id) != 0;
+    const bool stitch_photo_enabled =
+        camera_photo_stitch_is_enabled(outputs->photo) != 0;
+    if (!individual_photo_enabled && !stitch_photo_enabled)
+        return;
+
+    trigger_frame_match_t match = {};
+    const int match_result = trigger_frame_binder_find_frame(
+        outputs->binder, camera_id, sequence, &match);
+    const bool trigger_bound =
+        match_result == TRIGGER_FRAME_BINDER_OK && match.valid;
+    capture_backend_status_t capture_status = {};
+    if (!trigger_bound) {
+        camera_photo_note_unbound_frame(outputs->photo, camera_id);
+        if (capture_backend_get_status(outputs->capture, camera_id,
+                                       &capture_status) != CAPTURE_BACKEND_OK ||
+            !capture_status.timestamp_valid ||
+            capture_status.last_sequence != sequence)
+            return;
+    }
+
+    camera_backend_status_t camera_status = {};
+    const int status_result =
+        camera_backend_get_status(outputs->camera, camera_id, &camera_status);
+    camera_photo_metadata_t metadata = {};
+    metadata.camera_id = camera_id;
+    metadata.frame_id = sequence;
+    metadata.trigger_id = trigger_bound ? match.trigger_id : 0;
+    metadata.trigger_monotonic_ns =
+        trigger_bound ? match.trigger_monotonic_ns : 0;
+    metadata.trigger_realtime_ns =
+        trigger_bound ? match.trigger_realtime_ns : 0;
+    metadata.pps_id = trigger_bound ? match.pps_id : 0;
+    metadata.trigger_timer_tick =
+        trigger_bound ? match.trigger_timer_tick : 0;
+    metadata.frame_monotonic_ns = trigger_bound
+                                      ? match.v4l2_timestamp_ns
+                                      : capture_status.last_v4l2_timestamp_ns;
+    metadata.frame_realtime_ns = trigger_bound
+                                     ? match.realtime_dequeue_ns
+                                     : capture_status.last_realtime_dequeue_ns;
+    time_sync_resolution_t gnss_resolution = {};
+    const uint32_t timestamp_flags =
+        trigger_bound ? match.buffer_flags : capture_status.last_buffer_flags;
+    const bool v4l2_monotonic =
+        (timestamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+        V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    const bool gnss_utc_valid =
+        outputs->gnss_time && v4l2_monotonic &&
+        gnss_time_source_resolve_monotonic_ns(
+            outputs->gnss_time, metadata.frame_monotonic_ns,
+            &gnss_resolution) == GNSS_TIME_OK &&
+        gnss_resolution.valid;
+    if (gnss_utc_valid) {
+        metadata.frame_realtime_ns = gnss_resolution.utc_ns;
+        metadata.pps_id = gnss_resolution.pps_id;
+    }
+    metadata.trigger_to_frame_ns =
+        trigger_bound ? match.trigger_to_frame_ns : 0;
+    camera_photo_get_response_offset(outputs->photo, camera_id,
+                                     &metadata.sensor_response_offset_ns);
+    if (status_result == CAMERA_BACKEND_OK && camera_status.query_valid) {
+        metadata.exposure_us = camera_status.exposure_us;
+        metadata.gain_x1000 = camera_status.gain_x1000;
+        metadata.iso =
+            std::max<uint32_t>(1, static_cast<uint32_t>(camera_status.iso));
+        metadata.iso_estimated = camera_status.iso_estimated;
+        metadata.white_balance_valid = camera_status.white_balance_valid;
+        metadata.white_balance_auto = camera_status.white_balance_auto;
+        metadata.white_balance_converged =
+            camera_status.white_balance_converged;
+        metadata.white_balance_cct = camera_status.white_balance_cct;
+        metadata.wb_r_gain_x1000 = camera_status.wb_r_gain_x1000;
+        metadata.wb_gr_gain_x1000 = camera_status.wb_gr_gain_x1000;
+        metadata.wb_gb_gain_x1000 = camera_status.wb_gb_gain_x1000;
+        metadata.wb_b_gain_x1000 = camera_status.wb_b_gain_x1000;
+    }
+    bool register_anchored = false;
+    if (gnss_utc_valid) {
+        uint64_t trigger_utc_ns = 0;
+        imx586_v4l2::TimingRegisters timing = {};
+        const bool have_trigger =
+            gnss_time_source_trigger_utc_ns(
+                outputs->gnss_time, metadata.frame_monotonic_ns,
+                &trigger_utc_ns) == GNSS_TIME_OK;
+        const bool have_registers = imx586_v4l2::read_timing_registers(
+            metadata.camera_id == 0 ? "/dev/i2c-3" : "/dev/i2c-4", 0x1a,
+            &timing);
+        if (have_trigger && have_registers) {
+            /* The XVS edge anchors the frame readout; the first row's
+               integration starts (offset + margin - exposure) lines
+               before it.  The register method derives the exposure edge
+               from the live sensor registers instead of the dqbuf time. */
+            const uint64_t line_ns = imx586_v4l2::kImx586LineTimeNs;
+            const int64_t exposure_lines =
+                static_cast<int64_t>(timing.exposure_lines);
+            const int64_t edge_lines =
+                static_cast<int64_t>(timing.xvs_offset_lines) +
+                imx586_v4l2::kImx586ExposureMarginLines - exposure_lines;
+            if (edge_lines >= 0) {
+                metadata.exposure_start_realtime_ns =
+                    trigger_utc_ns +
+                    static_cast<uint64_t>(edge_lines) * line_ns;
+            } else {
+                metadata.exposure_start_realtime_ns =
+                    trigger_utc_ns -
+                    static_cast<uint64_t>(-edge_lines) * line_ns;
+            }
+            const uint64_t exposure_ns =
+                static_cast<uint64_t>(exposure_lines) * line_ns;
+            metadata.exposure_us =
+                static_cast<uint32_t>((exposure_ns + 500ULL) / 1000ULL);
+            if (metadata.exposure_us == 0)
+                metadata.exposure_us = 1;
+            register_anchored = true;
+        } else {
+            const uint64_t exposure_ns =
+                static_cast<uint64_t>(metadata.exposure_us) * 1000ULL;
+            metadata.exposure_start_realtime_ns =
+                metadata.frame_realtime_ns > exposure_ns
+                    ? metadata.frame_realtime_ns - exposure_ns
+                    : metadata.frame_realtime_ns;
+        }
+    } else if (trigger_bound) {
+        metadata.exposure_start_realtime_ns = add_signed_ns(
+            metadata.trigger_realtime_ns, metadata.sensor_response_offset_ns);
+    } else {
+        const uint64_t exposure_ns =
+            static_cast<uint64_t>(metadata.exposure_us) * 1000ULL;
+        metadata.exposure_start_realtime_ns =
+            metadata.frame_realtime_ns > exposure_ns
+                ? metadata.frame_realtime_ns - exposure_ns
+                : metadata.frame_realtime_ns;
+    }
+    metadata.exposure_center_realtime_ns =
+        metadata.exposure_start_realtime_ns +
+        static_cast<uint64_t>(metadata.exposure_us) * 500ULL;
+    metadata.utc_valid =
+        gnss_utc_valid || (trigger_bound && match.utc_valid) ? 1 : 0;
+    metadata.trigger_monotonic_is_uart_arrival =
+        trigger_bound ? match.monotonic_is_uart_arrival : 0;
+    std::snprintf(metadata.trigger_source,
+                  sizeof(metadata.trigger_source), "%s",
+                  trigger_bound ? match.source
+                                : (gnss_utc_valid ? "GNSS_PPS_FRAME_TIME"
+                                                  : "UNBOUND"));
+    std::snprintf(metadata.exposure_source,
+                  sizeof(metadata.exposure_source), "%s",
+                  register_anchored
+                      ? "IMX586_XVS_TRIGGER_ANCHORED"
+                      : (status_result == CAMERA_BACKEND_OK &&
+                         camera_status.query_valid
+                             ? (camera_status.sensor_controls_valid
+                                    ? "IMX586_V4L2_DQBUF_ESTIMATE"
+                                    : (trigger_bound
+                                           ? (camera_status
+                                                      .manual_settings_verified
+                                                  ? "MANUAL_VERIFIED_AT_DQBUF"
+                                                  : "RKAIQ_QUERY_AT_DQBUF")
+                                           : "RKAIQ_DQBUF_TIME_ESTIMATE"))
+                             : "UNAVAILABLE"));
+    if (individual_photo_enabled) {
+        camera_photo_submit_nv12(outputs->photo, camera_id, plane0,
+                                 plane0_size, plane1, plane1_size, &metadata);
+    }
+    if (stitch_photo_enabled) {
+        camera_photo_stitch_submit_nv12(outputs->photo, camera_id, plane0,
+                                        plane0_size, plane1, plane1_size,
+                                        &metadata);
+    }
+}
+
+void print_result(camera_backend_t *backend, const char *command,
+                  int camera_id, int result)
+{
+    if (result == CAMERA_BACKEND_OK) {
+        std::cout << "OK command=" << command << " camera_id=" << camera_id
+                  ;
+        if (std::strcmp(command, "exposure") == 0 ||
+            std::strcmp(command, "gain") == 0 ||
+            std::strcmp(command, "iso") == 0) {
+            camera_backend_status_t status = {};
+            const int status_result =
+                camera_backend_get_status(backend, camera_id, &status);
+            const bool verified = status_result == CAMERA_BACKEND_OK &&
+                                  status.manual_settings_verified != 0;
+            std::cout << " verification=" << (verified ? "verified" : "pending")
+                      << " manual_settings_verified=" << (verified ? 1 : 0)
+                      << " manual_settings_pending="
+                      << (status_result == CAMERA_BACKEND_OK
+                              ? status.manual_settings_pending
+                              : 0);
+        }
+        std::cout << '\n';
+    } else {
+        std::cout << "ERROR command=" << command << " camera_id=" << camera_id
+                  << " code=" << result
+                  << " reason=\"" << camera_backend_strerror(result) << "\"\n";
+    }
+}
+
+void print_capture_result(const char *command, int camera_id, int result)
+{
+    if (result == CAPTURE_BACKEND_OK) {
+        std::cout << "OK command=" << command << " camera_id=" << camera_id
+                  << '\n';
+    } else {
+        std::cout << "ERROR command=" << command
+                  << " camera_id=" << camera_id << " code=" << result
+                  << " reason=\"" << capture_backend_strerror(result)
+                  << "\"\n";
+    }
+}
+
+void invalid_command(const std::string &command, const char *usage)
+{
+    std::cout << "ERROR command=" << command << " reason=\"invalid syntax\""
+              << " usage=\"" << usage << "\"\n";
+}
+
+bool wait_camera_started(camera_backend_t *backend, int camera_id,
+                         bool expected_started,
+                         std::chrono::milliseconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        camera_backend_status_t status = {};
+        camera_backend_get_status(backend, camera_id, &status);
+        if ((status.started != 0) == expected_started)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+void switch_xvs_camera_fps(camera_backend_t *backend,
+                           capture_backend_t *capture,
+                           camera_uvc_backend_t *uvc,
+                           camera_photo_backend_t *photo, int camera_id,
+                           uint32_t fps)
+{
+    if (fps != 2 && fps != 4) {
+        std::cout << "ERROR command=fps camera_id=" << camera_id
+                  << " reason=\"XVS mode supports only 2 or 4 fps\"\n";
+        return;
+    }
+
+    capture_backend_status_t before = {};
+    const int capture_result =
+        capture_backend_get_status(capture, camera_id, &before);
+    if (capture_result != CAPTURE_BACKEND_OK) {
+        print_capture_result("fps", camera_id, capture_result);
+        return;
+    }
+    if (before.saving || camera_photo_is_enabled(photo, camera_id) ||
+        camera_photo_stitch_is_enabled(photo)) {
+        std::cout << "ERROR command=fps camera_id=" << camera_id
+                  << " reason=\"stop save/photo on this camera before changing XVS fps\"\n";
+        return;
+    }
+
+    uint32_t previous_fps = 0;
+    const int query_xvs_result =
+        camera_backend_get_xvs_fps(backend, camera_id, &previous_fps);
+    if (query_xvs_result != CAMERA_BACKEND_OK) {
+        print_result(backend, "fps-xvs-query", camera_id, query_xvs_result);
+        return;
+    }
+    if (previous_fps == fps) {
+        camera_uvc_set_source_fps(uvc, camera_id, fps);
+        if (before.running)
+            capture_backend_reset_fps_window(capture, camera_id, fps);
+    }
+
+    camera_backend_status_t preserved = {};
+    const bool preserve_manual =
+        before.running &&
+        camera_backend_get_status(backend, camera_id, &preserved) ==
+            CAMERA_BACKEND_OK &&
+        preserved.manual_mode && preserved.query_valid;
+    const int other_id = camera_id == 0 ? 1 : 0;
+    capture_backend_status_t other_before = {};
+    capture_backend_get_status(capture, other_id, &other_before);
+
+    if (before.running && previous_fps != fps) {
+        const int stop_result =
+            capture_backend_stop_stream(capture, camera_id);
+        if (stop_result != CAPTURE_BACKEND_OK) {
+            print_capture_result("fps-stop", camera_id, stop_result);
+            return;
+        }
+        if (!wait_camera_started(backend, camera_id, false,
+                                 std::chrono::seconds(3))) {
+            std::cout << "ERROR command=fps camera_id=" << camera_id
+                      << " reason=\"AIQ did not enter standby\"\n";
+            capture_backend_start_stream(capture, camera_id);
+            return;
+        }
+    }
+
+    bool manual_parameters_restored = true;
+    if (previous_fps != fps) {
+        const int set_result =
+            camera_backend_set_xvs_fps(backend, camera_id, fps);
+        if (set_result != CAMERA_BACKEND_OK) {
+            print_result(backend, "fps-xvs-thin", camera_id, set_result);
+            if (before.running)
+                capture_backend_start_stream(capture, camera_id);
+            return;
+        }
+        camera_uvc_set_source_fps(uvc, camera_id, fps);
+    }
+
+    if (!before.running) {
+        std::cout << "OK command=fps camera_id=" << camera_id
+                  << " configured_fps_x1000=" << fps * 1000U
+                  << " stream_restart=0 measured=0 xvs_master_hz=4\n";
+        return;
+    }
+
+    if (previous_fps != fps) {
+        const int start_result =
+            capture_backend_start_stream(capture, camera_id);
+        if (start_result != CAPTURE_BACKEND_OK) {
+            camera_backend_set_xvs_fps(backend, camera_id, previous_fps);
+            camera_uvc_set_source_fps(uvc, camera_id, previous_fps);
+            capture_backend_start_stream(capture, camera_id);
+            print_capture_result("fps-start", camera_id, start_result);
+            return;
+        }
+        if (!wait_camera_started(backend, camera_id, true,
+                                 std::chrono::seconds(5))) {
+            std::cout << "ERROR command=fps camera_id=" << camera_id
+                      << " reason=\"AIQ did not restart\"\n";
+            return;
+        }
+        if (preserve_manual) {
+            const int exposure_result = camera_backend_set_exposure(
+                backend, camera_id, preserved.exposure_us);
+            const int gain_result = camera_backend_set_gain(
+                backend, camera_id, preserved.gain_x1000);
+            manual_parameters_restored =
+                exposure_result == CAMERA_BACKEND_OK &&
+                gain_result == CAMERA_BACKEND_OK;
+            if (!manual_parameters_restored) {
+                std::cout << "ERROR command=fps camera_id=" << camera_id
+                          << " reason=\"manual exposure/gain restore failed\""
+                          << " exposure_result=" << exposure_result
+                          << " gain_result=" << gain_result << '\n';
+                return;
+            }
+        }
+        capture_backend_reset_fps_window(capture, camera_id, fps);
+    }
+
+    capture_backend_status_t measured = {};
+    bool stable = false;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (capture_backend_get_status(capture, camera_id, &measured) !=
+            CAPTURE_BACKEND_OK)
+            continue;
+        const uint32_t requested_x1000 = fps * 1000U;
+        const uint32_t tolerance_x1000 =
+            std::max(100U, requested_x1000 / 20U);
+        const uint32_t difference =
+            measured.fps_x1000 >= requested_x1000
+                ? measured.fps_x1000 - requested_x1000
+                : requested_x1000 - measured.fps_x1000;
+        if (measured.fps_stable && difference <= tolerance_x1000) {
+            stable = true;
+            break;
+        }
+    }
+
+    capture_backend_status_t other_after = {};
+    capture_backend_get_status(capture, other_id, &other_after);
+    const bool other_continued =
+        other_before.running && other_after.running &&
+        other_after.frames_captured > other_before.frames_captured;
+    const bool other_ok = !other_before.running || other_continued;
+    if (!stable || !other_ok) {
+        std::cout << "ERROR command=fps camera_id=" << camera_id
+                  << " reason=\""
+                  << (!stable ? "target fps did not stabilize"
+                              : "the other camera stopped advancing")
+                  << "\" requested_fps_x1000=" << fps * 1000U
+                  << " measured_fps_x1000=" << measured.fps_x1000
+                  << " other_camera_id=" << other_id
+                  << " other_frames_before=" << other_before.frames_captured
+                  << " other_frames_after=" << other_after.frames_captured
+                  << '\n';
+        return;
+    }
+    std::cout << "OK command=fps camera_id=" << camera_id
+              << " requested_fps_x1000=" << fps * 1000U
+              << " measured_fps_x1000=" << measured.fps_x1000
+              << " fps_stable=1 xvs_master_hz=4"
+              << " sensor_restart=" << (previous_fps != fps ? 1 : 0)
+              << " other_camera_id=" << other_id
+              << " other_camera_was_running=" << other_before.running
+              << " other_camera_continued="
+              << (other_before.running ? (other_continued ? 1 : 0) : -1)
+              << " manual_parameters_restored="
+              << (manual_parameters_restored ? 1 : 0)
+              << '\n';
+}
+
+bool execute_command(camera_backend_t *backend, capture_backend_t *capture,
+                     camera_uvc_backend_t *uvc, camera_net_backend_t *net,
+                     camera_photo_backend_t *photo,
+                     xvs_uart_controller_t *xvs,
+                     time_sync_service_t *time_sync,
+                     gnss_time_source_t *gnss_time,
+                     trigger_frame_binder_t *binder,
+                     trigger_simulator_t *simulator,
+                     const std::string &line)
+{
+    std::istringstream stream(line);
+    std::string command;
+    stream >> command;
+    if (command.empty())
+        return true;
+
+    if (command == "quit" || command == "exit")
+        return false;
+    if (command == "help") {
+        print_commands();
+        return true;
+    }
+
+    if (command == "status") {
+        std::string target = "all";
+        std::string extra;
+        stream >> target;
+        if (stream >> extra) {
+            invalid_command(command, "status [all|0|1]");
+            return true;
+        }
+        if (target == "all") {
+            for (int camera_id = 0; camera_id < CAMERA_BACKEND_CAMERA_COUNT;
+                 ++camera_id) {
+                print_status(backend, camera_id);
+                print_capture_status(capture, camera_id);
+            }
+            for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT;
+                 ++camera_id)
+                print_uvc_status(uvc, camera_id);
+            for (int camera_id = 0;
+                 camera_id < CAMERA_NET_CAMERA_COUNT; ++camera_id)
+                print_net_status(net, camera_id);
+            for (int camera_id = 0;
+                 camera_id < CAMERA_PHOTO_CAMERA_COUNT; ++camera_id)
+                print_photo_status(photo, camera_id);
+        } else {
+            int camera_id = -1;
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command, "status [all|0|1]");
+                return true;
+            }
+            print_status(backend, camera_id);
+            print_capture_status(capture, camera_id);
+            print_uvc_status(uvc, camera_id);
+            print_net_status(net, camera_id);
+            print_photo_status(photo, camera_id);
+        }
+        return true;
+    }
+
+    if (command == "capture-status") {
+        std::string target = "all";
+        std::string extra;
+        stream >> target;
+        if (stream >> extra) {
+            invalid_command(command, "capture-status [all|0|1]");
+            return true;
+        }
+        if (target == "all") {
+            for (int camera_id = 0;
+                 camera_id < CAPTURE_BACKEND_CAMERA_COUNT; ++camera_id) {
+                print_capture_status(capture, camera_id);
+            }
+        } else {
+            int camera_id = -1;
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command, "capture-status [all|0|1]");
+                return true;
+            }
+            print_capture_status(capture, camera_id);
+        }
+        return true;
+    }
+
+    if (command == "photo-status") {
+        std::string target = "all";
+        std::string extra;
+        stream >> target;
+        if (stream >> extra) {
+            invalid_command(command, "photo-status [all|0|1]");
+            return true;
+        }
+        if (target == "all") {
+            for (int camera_id = 0;
+                 camera_id < CAMERA_PHOTO_CAMERA_COUNT; ++camera_id)
+                print_photo_status(photo, camera_id);
+        } else {
+            int camera_id = -1;
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command, "photo-status [all|0|1]");
+                return true;
+            }
+            print_photo_status(photo, camera_id);
+        }
+        return true;
+    }
+
+    if (command == "stitch-photo-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "stitch-photo-status");
+            return true;
+        }
+        print_stitch_photo_status(photo);
+        return true;
+    }
+
+    if (command == "stitch-transfer-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "stitch-transfer-status");
+            return true;
+        }
+        print_stitch_transfer_status(photo);
+        return true;
+    }
+
+    if (command == "stitch-transfer-start") {
+        std::string output_dir;
+        std::string host;
+        std::string port_text;
+        std::string extra;
+        uint32_t port = 0;
+        if (!(stream >> output_dir >> host >> port_text) ||
+            !parse_u32(port_text, &port) || !port || port > UINT16_MAX ||
+            (stream >> extra)) {
+            invalid_command(
+                command, "stitch-transfer-start OUTPUT_DIR HOST PORT");
+            return true;
+        }
+        for (int camera_id = 0;
+             camera_id < CAMERA_PHOTO_CAMERA_COUNT; ++camera_id) {
+            capture_backend_status_t capture_status = {};
+            const int capture_result = capture_backend_get_status(
+                capture, camera_id, &capture_status);
+            if (capture_result != CAPTURE_BACKEND_OK ||
+                !capture_status.running) {
+                std::cout
+                    << "ERROR command=stitch-transfer-start camera_id="
+                    << camera_id
+                    << " reason=\"both camera streams must be running\"\n";
+                return true;
+            }
+        }
+        const int result = camera_photo_stitch_transfer_start(
+            photo, output_dir.c_str(), host.c_str(),
+            static_cast<uint16_t>(port));
+        if (result == CAMERA_PHOTO_OK) {
+            std::cout
+                << "OK command=stitch-transfer-start output_dir=\""
+                << output_dir << "\" host=\"" << host << "\" port=" << port
+                << " layout=vertical size=4000x6000 top_camera=0 "
+                   "bottom_camera=1\n";
+            print_stitch_transfer_status(photo);
+        } else {
+            std::cout << "ERROR command=stitch-transfer-start code=" << result
+                      << " reason=\"" << camera_photo_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "stitch-transfer-stop") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "stitch-transfer-stop");
+            return true;
+        }
+        const int result = camera_photo_stitch_transfer_stop(photo);
+        if (result == CAMERA_PHOTO_OK) {
+            std::cout << "OK command=stitch-transfer-stop\n";
+            print_stitch_transfer_status(photo);
+        } else {
+            std::cout << "ERROR command=stitch-transfer-stop code=" << result
+                      << " reason=\"" << camera_photo_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "stitch-photo-start") {
+        std::string output_dir;
+        std::string extra;
+        if (!(stream >> output_dir) || (stream >> extra)) {
+            invalid_command(command, "stitch-photo-start OUTPUT_DIR");
+            return true;
+        }
+        camera_photo_stitch_transfer_status_t transfer_status = {};
+        if (camera_photo_stitch_transfer_get_status(
+                photo, &transfer_status) == CAMERA_PHOTO_OK &&
+            transfer_status.enabled) {
+            std::cout
+                << "ERROR command=stitch-photo-start reason=\"stitch transfer "
+                   "is active; use stitch-transfer-stop first\"\n";
+            return true;
+        }
+        for (int camera_id = 0;
+             camera_id < CAMERA_PHOTO_CAMERA_COUNT; ++camera_id) {
+            capture_backend_status_t capture_status = {};
+            const int capture_result = capture_backend_get_status(
+                capture, camera_id, &capture_status);
+            if (capture_result != CAPTURE_BACKEND_OK ||
+                !capture_status.running) {
+                std::cout
+                    << "ERROR command=stitch-photo-start camera_id="
+                    << camera_id
+                    << " reason=\"both camera streams must be running\"\n";
+                return true;
+            }
+        }
+        const int result =
+            camera_photo_stitch_start(photo, output_dir.c_str());
+        if (result == CAMERA_PHOTO_OK) {
+            std::cout << "OK command=stitch-photo-start output_dir=\""
+                      << output_dir
+                      << "\" layout=vertical size=4000x6000 top_camera=0 "
+                         "bottom_camera=1\n";
+        } else {
+            std::cout << "ERROR command=stitch-photo-start code=" << result
+                      << " reason=\"" << camera_photo_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "stitch-photo-stop") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "stitch-photo-stop");
+            return true;
+        }
+        camera_photo_stitch_transfer_status_t transfer_status = {};
+        if (camera_photo_stitch_transfer_get_status(
+                photo, &transfer_status) == CAMERA_PHOTO_OK &&
+            transfer_status.enabled) {
+            std::cout
+                << "ERROR command=stitch-photo-stop reason=\"stitch transfer "
+                   "is active; use stitch-transfer-stop\"\n";
+            return true;
+        }
+        const int result = camera_photo_stitch_stop(photo);
+        if (result == CAMERA_PHOTO_OK) {
+            std::cout << "OK command=stitch-photo-stop\n";
+        } else {
+            std::cout << "ERROR command=stitch-photo-stop code=" << result
+                      << " reason=\"" << camera_photo_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "photo-start") {
+        std::string camera_text;
+        std::string output_dir;
+        std::string extra;
+        int camera_id = -1;
+        if (!(stream >> camera_text >> output_dir) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id)) {
+            invalid_command(command, "photo-start CAMERA_ID OUTPUT_DIR");
+            return true;
+        }
+        capture_backend_status_t capture_status = {};
+        const int capture_result = capture_backend_get_status(
+            capture, camera_id, &capture_status);
+        if (capture_result != CAPTURE_BACKEND_OK || !capture_status.running) {
+            std::cout << "ERROR command=photo-start camera_id=" << camera_id
+                      << " reason=\"camera capture is not running; use "
+                         "stream-start "
+                      << camera_id << " first\"\n";
+            return true;
+        }
+        const int result =
+            camera_photo_start(photo, camera_id, output_dir.c_str());
+        if (result == CAMERA_PHOTO_OK) {
+            std::cout << "OK command=photo-start camera_id=" << camera_id
+                      << " output_dir=\"" << output_dir << "\""
+                      << " trigger_required=1"
+                      << " frame_parameter_policy="
+                         "MANUAL_VERIFIED_AT_DQBUF\n";
+        } else {
+            std::cout << "ERROR command=photo-start camera_id=" << camera_id
+                      << " code=" << result << " reason=\""
+                      << camera_photo_strerror(result) << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "photo-stop") {
+        std::string camera_text;
+        std::string extra;
+        int camera_id = -1;
+        if (!(stream >> camera_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id)) {
+            invalid_command(command, "photo-stop CAMERA_ID");
+            return true;
+        }
+        const int result = camera_photo_stop(photo, camera_id);
+        if (result == CAMERA_PHOTO_OK) {
+            std::cout << "OK command=photo-stop camera_id=" << camera_id
+                      << '\n';
+        } else {
+            std::cout << "ERROR command=photo-stop camera_id=" << camera_id
+                      << " code=" << result << " reason=\""
+                      << camera_photo_strerror(result) << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "photo-offset") {
+        std::string camera_text;
+        std::string offset_text;
+        std::string extra;
+        int camera_id = -1;
+        int64_t offset_ns = 0;
+        if (!(stream >> camera_text >> offset_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id) ||
+            !parse_i64(offset_text, &offset_ns)) {
+            invalid_command(command,
+                            "photo-offset CAMERA_ID SENSOR_RESPONSE_OFFSET_NS");
+            return true;
+        }
+        const int result =
+            camera_photo_set_response_offset(photo, camera_id, offset_ns);
+        if (result == CAMERA_PHOTO_OK) {
+            std::cout << "OK command=photo-offset camera_id=" << camera_id
+                      << " sensor_response_offset_ns=" << offset_ns << '\n';
+        } else {
+            std::cout << "ERROR command=photo-offset camera_id=" << camera_id
+                      << " code=" << result << " reason=\""
+                      << camera_photo_strerror(result) << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "uvc-status") {
+        std::string target = "all";
+        std::string extra;
+        stream >> target;
+        if (stream >> extra) {
+            invalid_command(command, "uvc-status [CAMERA_ID|all]");
+            return true;
+        }
+        if (target == "all") {
+            for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT;
+                 ++camera_id)
+                print_uvc_status(uvc, camera_id);
+        } else {
+            int camera_id = -1;
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command, "uvc-status [CAMERA_ID|all]");
+                return true;
+            }
+            print_uvc_status(uvc, camera_id);
+        }
+        return true;
+    }
+
+    if (command == "uvc-start") {
+        std::string target;
+        std::string extra;
+        if (!(stream >> target) || (stream >> extra)) {
+            invalid_command(command, "uvc-start CAMERA_ID|all");
+            return true;
+        }
+
+        int first_camera = 0;
+        int camera_count = CAMERA_UVC_CAMERA_COUNT;
+        int camera_id = -1;
+        if (target != "all") {
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command, "uvc-start CAMERA_ID|all");
+                return true;
+            }
+            first_camera = camera_id;
+            camera_count = 1;
+        }
+
+        for (int offset = 0; offset < camera_count; ++offset) {
+            const int id = first_camera + offset;
+            capture_backend_status_t capture_status = {};
+            const int capture_result = capture_backend_get_status(
+                capture, id, &capture_status);
+            if (capture_result != CAPTURE_BACKEND_OK ||
+                !capture_status.running) {
+                std::cout << "ERROR command=uvc-start camera_id=" << id
+                          << " reason=\"camera capture is not running; use "
+                             "stream-start " << id << " first\"\n";
+                return true;
+            }
+        }
+
+        const int result = target == "all"
+                               ? camera_uvc_start_all(uvc)
+                               : camera_uvc_start(uvc, camera_id);
+        if (result == CAMERA_UVC_OK) {
+            std::cout << "OK command=uvc-start target=" << target
+                      << " mode=4000x3000@10fps/MJPEG\n";
+        } else {
+            std::cout << "ERROR command=uvc-start target=" << target
+                      << " code="
+                      << result << " reason=\""
+                      << camera_uvc_strerror(result) << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "uvc-stop") {
+        std::string target = "all";
+        std::string extra;
+        stream >> target;
+        if (stream >> extra) {
+            invalid_command(command, "uvc-stop [CAMERA_ID|all]");
+            return true;
+        }
+        int camera_id = -1;
+        if (target != "all" && !parse_camera_id(target, &camera_id)) {
+            invalid_command(command, "uvc-stop [CAMERA_ID|all]");
+            return true;
+        }
+        const int result = target == "all"
+                               ? camera_uvc_stop(uvc)
+                               : camera_uvc_stop_camera(uvc, camera_id);
+        if (result == CAMERA_UVC_OK) {
+            std::cout << "OK command=uvc-stop target=" << target
+                      << " usb_gadget=kept rndis=kept\n";
+        } else {
+            std::cout << "ERROR command=uvc-stop target=" << target
+                      << " code=" << result
+                      << " reason=\"" << camera_uvc_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "net-status") {
+        std::string target = "all";
+        std::string extra;
+        stream >> target;
+        if (stream >> extra) {
+            invalid_command(command, "net-status [CAMERA_ID|all]");
+            return true;
+        }
+        if (target == "all") {
+            for (int camera_id = 0;
+                 camera_id < CAMERA_NET_CAMERA_COUNT; ++camera_id)
+                print_net_status(net, camera_id);
+        } else {
+            int camera_id = -1;
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command, "net-status [CAMERA_ID|all]");
+                return true;
+            }
+            print_net_status(net, camera_id);
+        }
+        return true;
+    }
+
+    if (command == "net-start") {
+        std::string camera_text;
+        std::string extra;
+        int camera_id = -1;
+        if (!(stream >> camera_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id)) {
+            invalid_command(command, "net-start CAMERA_ID");
+            return true;
+        }
+        capture_backend_status_t capture_status = {};
+        int result = capture_backend_get_status(capture, camera_id,
+                                                &capture_status);
+        if (result != CAPTURE_BACKEND_OK || !capture_status.running) {
+            std::cout << "ERROR command=net-start camera_id=" << camera_id
+                      << " reason=\"camera " << camera_id
+                      << " capture is not running; use stream-start "
+                      << camera_id << " first\"\n";
+            return true;
+        }
+        result = camera_net_start(net, camera_id);
+        if (result == CAMERA_NET_OK) {
+            std::cout << "OK command=net-start camera_id=" << camera_id
+                      << " mode=4000x3000@10fps/MJPEG"
+                      << " url=http://<board-ip>:8080/cam" << camera_id
+                      << '\n';
+        } else {
+            std::cout << "ERROR command=net-start camera_id=" << camera_id
+                      << " code="
+                      << result << " reason=\""
+                      << camera_net_strerror(result) << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "net-stop") {
+        std::string target = "all";
+        std::string extra;
+        stream >> target;
+        if (stream >> extra) {
+            invalid_command(command, "net-stop [CAMERA_ID|all]");
+            return true;
+        }
+        if (target == "all") {
+            const int result = camera_net_stop(net);
+            if (result == CAMERA_NET_OK) {
+                std::cout << "OK command=net-stop target=all\n";
+            } else {
+                std::cout << "ERROR command=net-stop target=all code="
+                          << result << " reason=\""
+                          << camera_net_strerror(result) << "\"\n";
+            }
+        } else {
+            int camera_id = -1;
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command, "net-stop [CAMERA_ID|all]");
+                return true;
+            }
+            const int result = camera_net_stop_camera(net, camera_id);
+            if (result == CAMERA_NET_OK) {
+                std::cout << "OK command=net-stop camera_id=" << camera_id
+                          << '\n';
+            } else {
+                std::cout << "ERROR command=net-stop camera_id=" << camera_id
+                          << " code=" << result << " reason=\""
+                          << camera_net_strerror(result) << "\"\n";
+            }
+        }
+        return true;
+    }
+
+    if (command == "sync-idle" || command == "sync-stop") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command,
+                            command == "sync-idle" ? "sync-idle"
+                                                   : "sync-stop");
+            return true;
+        }
+        if (!require_xvs_controller(command.c_str(), xvs))
+            return true;
+        print_xvs_result(command.c_str(),
+                         command == "sync-idle" ? xvs_uart_idle(xvs)
+                                                : xvs_uart_stop(xvs));
+        return true;
+    }
+
+    if (command == "sync-start") {
+        std::string frequency_text;
+        std::string low_pulse_text;
+        std::string extra;
+        uint32_t frequency_hz = 0;
+        uint32_t low_pulse_us = 10;
+        if (!(stream >> frequency_text) ||
+            !parse_u32(frequency_text, &frequency_hz) ||
+            ((stream >> low_pulse_text) &&
+             !parse_u32(low_pulse_text, &low_pulse_us)) ||
+            (stream >> extra)) {
+            invalid_command(command, "sync-start 2|4 [LOW_PULSE_US]");
+            return true;
+        }
+        if (!require_xvs_controller(command.c_str(), xvs))
+            return true;
+        if (!both_capture_streams_running(capture)) {
+            std::cout << "ERROR command=sync-start reason=\"both capture "
+                         "streams must be running; use stream-start all\"\n";
+            return true;
+        }
+        const int result = xvs_uart_start(xvs, frequency_hz, low_pulse_us);
+        print_xvs_result(command.c_str(), result);
+        if (result == XVS_UART_OK) {
+            std::cout << "XVS_OUTPUT state=RUNNING frequency_hz="
+                      << frequency_hz << " low_pulse_us=" << low_pulse_us
+                      << '\n';
+        }
+        return true;
+    }
+
+    if (command == "sync-count") {
+        std::string frequency_text;
+        std::string pulse_count_text;
+        std::string low_pulse_text;
+        std::string extra;
+        uint32_t frequency_hz = 0;
+        uint32_t pulse_count = 0;
+        uint32_t low_pulse_us = 10;
+        if (!(stream >> frequency_text >> pulse_count_text) ||
+            !parse_u32(frequency_text, &frequency_hz) ||
+            !parse_u32(pulse_count_text, &pulse_count) ||
+            ((stream >> low_pulse_text) &&
+             !parse_u32(low_pulse_text, &low_pulse_us)) ||
+            (stream >> extra)) {
+            invalid_command(
+                command, "sync-count 2|4 PULSE_COUNT [LOW_PULSE_US]");
+            return true;
+        }
+        if (!require_xvs_controller(command.c_str(), xvs))
+            return true;
+        if (!both_capture_streams_running(capture)) {
+            std::cout << "ERROR command=sync-count reason=\"both capture "
+                         "streams must be running; use stream-start all\"\n";
+            return true;
+        }
+        const int result = xvs_uart_count(xvs, frequency_hz, low_pulse_us,
+                                          pulse_count);
+        print_xvs_result(command.c_str(), result);
+        if (result == XVS_UART_OK) {
+            std::cout << "XVS_OUTPUT state=COUNTING frequency_hz="
+                      << frequency_hz << " low_pulse_us=" << low_pulse_us
+                      << " requested_pulses=" << pulse_count << '\n';
+        }
+        return true;
+    }
+
+    if (command == "sync-controller-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "sync-controller-status");
+            return true;
+        }
+        print_xvs_controller_status(xvs);
+        return true;
+    }
+
+    if (command == "time-sync-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "time-sync-status");
+            return true;
+        }
+        print_time_sync_status(time_sync, gnss_time);
+        return true;
+    }
+
+    if (command == "time-sync-reset") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "time-sync-reset");
+            return true;
+        }
+        const int result = time_sync_reset(time_sync);
+        if (result == TIME_SYNC_OK)
+            std::cout << "OK command=time-sync-reset\n";
+        else
+            std::cout << "ERROR command=time-sync-reset code=" << result
+                      << " reason=\"" << time_sync_strerror(result)
+                      << "\"\n";
+        return true;
+    }
+
+    if (command == "sync-bind-reset") {
+        std::string ignored_text;
+        std::string extra;
+        uint32_t ignored_triggers = 0;
+        if ((stream >> ignored_text) &&
+            !parse_u32(ignored_text, &ignored_triggers)) {
+            invalid_command(command, "sync-bind-reset [PRE_SHUTTER_TRIGGERS]");
+            return true;
+        }
+        if (stream >> extra) {
+            invalid_command(command, "sync-bind-reset [PRE_SHUTTER_TRIGGERS]");
+            return true;
+        }
+        const int result = trigger_frame_binder_reset(binder, ignored_triggers);
+        if (result == TRIGGER_FRAME_BINDER_OK) {
+            std::cout << "OK command=sync-bind-reset ignored_triggers="
+                      << ignored_triggers << '\n';
+        } else {
+            std::cout << "ERROR command=sync-bind-reset code=" << result
+                      << " reason=\"" << trigger_frame_binder_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "sync-bind-log") {
+        std::string path;
+        std::string extra;
+        if (!(stream >> path) || (stream >> extra)) {
+            invalid_command(command, "sync-bind-log CSV_PATH|off");
+            return true;
+        }
+        const char *selected_path = path == "off" ? nullptr : path.c_str();
+        const int result = trigger_frame_binder_set_csv_path(binder,
+                                                              selected_path);
+        if (result == TRIGGER_FRAME_BINDER_OK) {
+            std::cout << "OK command=sync-bind-log path=\""
+                      << (selected_path ? selected_path : "") << "\"\n";
+        } else {
+            std::cout << "ERROR command=sync-bind-log code=" << result
+                      << " reason=\"" << trigger_frame_binder_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "sync-bind-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "sync-bind-status");
+            return true;
+        }
+        print_trigger_binding_status(binder);
+        return true;
+    }
+
+    if (command == "sync-bind-last") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "sync-bind-last");
+            return true;
+        }
+        print_trigger_binding_last(binder);
+        return true;
+    }
+
+    if (command == "sync-sim-start") {
+        std::string frequency_text;
+        std::string count_text;
+        std::string extra;
+        uint32_t frequency_hz = 0;
+        uint32_t pulse_count = 0;
+        if (!(stream >> frequency_text) ||
+            !parse_u32(frequency_text, &frequency_hz) ||
+            ((stream >> count_text) && !parse_u32(count_text, &pulse_count)) ||
+            (stream >> extra) || (frequency_hz != 2 && frequency_hz != 4)) {
+            invalid_command(command, "sync-sim-start 2|4 [PULSE_COUNT]");
+            return true;
+        }
+        if (!both_capture_streams_running(capture)) {
+            std::cout << "ERROR command=sync-sim-start reason=\"both capture "
+                         "streams must be running; use stream-start all\"\n";
+            return true;
+        }
+        const int result = trigger_simulator_start(simulator, frequency_hz,
+                                                   pulse_count);
+        if (result == TRIGGER_SIMULATOR_OK) {
+            std::cout << "OK command=sync-sim-start frequency_hz="
+                      << frequency_hz << " requested_pulses=" << pulse_count
+                      << " physical_xvs=0 source=SIM\n";
+        } else {
+            std::cout << "ERROR command=sync-sim-start code=" << result
+                      << " reason=\"" << trigger_simulator_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "sync-sim-stop") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "sync-sim-stop");
+            return true;
+        }
+        const int result = trigger_simulator_stop(simulator);
+        if (result == TRIGGER_SIMULATOR_OK) {
+            std::cout << "OK command=sync-sim-stop physical_xvs=0\n";
+        } else {
+            std::cout << "ERROR command=sync-sim-stop code=" << result
+                      << " reason=\"" << trigger_simulator_strerror(result)
+                      << "\"\n";
+        }
+        return true;
+    }
+
+    if (command == "sync-sim-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "sync-sim-status");
+            return true;
+        }
+        print_trigger_simulator_status(simulator);
+        return true;
+    }
+
+    if (command == "sync-status") {
+        std::string extra;
+        if (stream >> extra) {
+            invalid_command(command, "sync-status");
+            return true;
+        }
+        print_xvs_controller_status(xvs);
+        print_time_sync_status(time_sync, gnss_time);
+        print_sync_status(capture);
+        print_trigger_binding_status(binder);
+        print_trigger_simulator_status(simulator);
+        return true;
+    }
+
+    if (command == "stream-start" || command == "stream-stop") {
+        std::string target;
+        std::string extra;
+        if (!(stream >> target) || (stream >> extra)) {
+            invalid_command(command,
+                            command == "stream-start"
+                                ? "stream-start CAMERA_ID|all"
+                                : "stream-stop CAMERA_ID|all");
+            return true;
+        }
+        if (command == "stream-stop") {
+            trigger_simulator_status_t simulator_status = {};
+            if (trigger_simulator_get_status(simulator, &simulator_status) ==
+                    TRIGGER_SIMULATOR_OK && simulator_status.running) {
+                trigger_simulator_stop(simulator);
+                std::cout << "SYNC_SIMULATOR_STOPPED reason=capture-stop\n";
+            }
+        }
+        if (target == "all") {
+            for (int camera_id = 0;
+                 camera_id < CAPTURE_BACKEND_CAMERA_COUNT; ++camera_id) {
+                if (command == "stream-stop" &&
+                    camera_photo_is_enabled(photo, camera_id)) {
+                    const int photo_result = camera_photo_stop(photo, camera_id);
+                    if (photo_result == CAMERA_PHOTO_OK) {
+                        std::cout << "PHOTO_STOPPED camera_id=" << camera_id
+                                  << " reason=capture-stop\n";
+                    }
+                }
+                int result = command == "stream-start"
+                                 ? capture_backend_start_stream(capture,
+                                                                camera_id)
+                                 : capture_backend_stop_stream(capture,
+                                                               camera_id);
+                print_capture_result(command.c_str(), camera_id, result);
+            }
+        } else {
+            int camera_id = -1;
+            if (!parse_camera_id(target, &camera_id)) {
+                invalid_command(command,
+                                command == "stream-start"
+                                    ? "stream-start CAMERA_ID|all"
+                                    : "stream-stop CAMERA_ID|all");
+                return true;
+            }
+            if (command == "stream-stop" &&
+                camera_photo_is_enabled(photo, camera_id)) {
+                const int photo_result = camera_photo_stop(photo, camera_id);
+                if (photo_result == CAMERA_PHOTO_OK) {
+                    std::cout << "PHOTO_STOPPED camera_id=" << camera_id
+                              << " reason=capture-stop\n";
+                }
+            }
+            int result = command == "stream-start"
+                             ? capture_backend_start_stream(capture, camera_id)
+                             : capture_backend_stop_stream(capture, camera_id);
+            print_capture_result(command.c_str(), camera_id, result);
+        }
+        return true;
+    }
+
+    if (command == "save-start") {
+        std::string camera_text;
+        std::string output_dir;
+        std::string extra;
+        int camera_id = -1;
+        if (!(stream >> camera_text >> output_dir) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id)) {
+            invalid_command(command, "save-start CAMERA_ID OUTPUT_DIR");
+            return true;
+        }
+        print_capture_result(
+            command.c_str(), camera_id,
+            capture_backend_start_save(capture, camera_id,
+                                       output_dir.c_str()));
+        return true;
+    }
+
+    if (command == "save-stop") {
+        std::string camera_text;
+        std::string extra;
+        int camera_id = -1;
+        if (!(stream >> camera_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id)) {
+            invalid_command(command, "save-stop CAMERA_ID");
+            return true;
+        }
+        print_capture_result(command.c_str(), camera_id,
+                             capture_backend_stop_save(capture, camera_id));
+        return true;
+    }
+
+    if (command == "auto") {
+        std::string camera_text;
+        std::string extra;
+        int camera_id = -1;
+        if (!(stream >> camera_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id)) {
+            invalid_command(command, "auto CAMERA_ID");
+            return true;
+        }
+        print_result(backend, command.c_str(), camera_id,
+                     camera_backend_set_auto(backend, camera_id));
+        return true;
+    }
+
+    if (command == "exposure") {
+        std::string camera_text;
+        std::string exposure_text;
+        std::string extra;
+        int camera_id = -1;
+        uint32_t exposure_us = 0;
+        if (!(stream >> camera_text >> exposure_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id) ||
+            !parse_u32(exposure_text, &exposure_us)) {
+            invalid_command(command, "exposure CAMERA_ID EXPOSURE_US");
+            return true;
+        }
+        print_result(backend, command.c_str(), camera_id,
+                     camera_backend_set_exposure(backend, camera_id,
+                                                 exposure_us));
+        return true;
+    }
+
+    if (command == "gain") {
+        std::string camera_text;
+        std::string gain_text;
+        std::string extra;
+        int camera_id = -1;
+        uint32_t gain_x1000 = 0;
+        if (!(stream >> camera_text >> gain_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id) ||
+            !parse_u32(gain_text, &gain_x1000)) {
+            invalid_command(command, "gain CAMERA_ID GAIN_X1000");
+            return true;
+        }
+        print_result(backend, command.c_str(), camera_id,
+                     camera_backend_set_gain(backend, camera_id,
+                                             gain_x1000));
+        return true;
+    }
+
+    if (command == "iso") {
+        std::string camera_text;
+        std::string iso_text;
+        std::string extra;
+        int camera_id = -1;
+        uint32_t iso = 0;
+        if (!(stream >> camera_text >> iso_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id) ||
+            !parse_u32(iso_text, &iso)) {
+            invalid_command(command, "iso CAMERA_ID ISO");
+            return true;
+        }
+        print_result(backend, command.c_str(), camera_id,
+                     camera_backend_set_iso(backend, camera_id, iso));
+        return true;
+    }
+
+    if (command == "fps") {
+        std::string camera_text;
+        std::string fps_text;
+        std::string extra;
+        int camera_id = -1;
+        uint32_t fps = 0;
+        if (!(stream >> camera_text >> fps_text) || (stream >> extra) ||
+            !parse_camera_id(camera_text, &camera_id) ||
+            !parse_u32(fps_text, &fps)) {
+            invalid_command(command, "fps CAMERA_ID FPS");
+            return true;
+        }
+        switch_xvs_camera_fps(backend, capture, uvc, photo, camera_id, fps);
+        return true;
+    }
+
+    if (command == "wait") {
+        std::string milliseconds_text;
+        std::string extra;
+        uint32_t milliseconds = 0;
+        if (!(stream >> milliseconds_text) || (stream >> extra) ||
+            !parse_u32(milliseconds_text, &milliseconds)) {
+            invalid_command(command, "wait MILLISECONDS");
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+        std::cout << "OK command=wait milliseconds=" << milliseconds << '\n';
+        return true;
+    }
+
+    std::cout << "ERROR command=" << command << " reason=\"unknown command\"\n";
+    return true;
+}
+
+struct unified_uart_control_context {
+    camera_backend_t *backend = nullptr;
+    capture_backend_t *capture = nullptr;
+    camera_uvc_backend_t *uvc = nullptr;
+    camera_net_backend_t *net = nullptr;
+    camera_photo_backend_t *photo = nullptr;
+    xvs_uart_controller_t *xvs = nullptr;
+    time_sync_service_t *time_sync = nullptr;
+    gnss_time_source_t *gnss_time = nullptr;
+    trigger_frame_binder_t *binder = nullptr;
+    trigger_simulator_t *simulator = nullptr;
+    std::mutex command_mutex;
+};
+
+int process_unified_uart_control(const char *request, char *response,
+                                 size_t response_capacity,
+                                 size_t *response_size, void *user_data)
+{
+    auto *context = static_cast<unified_uart_control_context *>(user_data);
+    if (!request || !response || !response_size || !context)
+        return XVS_UART_ERR_ARGUMENT;
+
+    std::string framed_response;
+    const auto handler = [&](const std::string &command, std::string *output) {
+        std::lock_guard<std::mutex> lock(context->command_mutex);
+        std::ostringstream captured;
+        std::streambuf *saved = std::cout.rdbuf(captured.rdbuf());
+        execute_command(context->backend, context->capture, context->uvc,
+                        context->net, context->photo, context->xvs,
+                        context->time_sync, context->gnss_time, context->binder,
+                        context->simulator, command);
+        std::cout.flush();
+        std::cout.rdbuf(saved);
+        *output = captured.str();
+    };
+    const int result =
+        camera_control_uart::process_frame(request, handler, &framed_response);
+    if (result != camera_control_uart::OK)
+        return XVS_UART_ERR_PROTOCOL;
+    if (framed_response.size() > response_capacity)
+        return XVS_UART_ERR_IO;
+    std::memcpy(response, framed_response.data(), framed_response.size());
+    *response_size = framed_response.size();
+    return XVS_UART_OK;
+}
+
+bool autostart_capture_only(capture_backend_t *capture, uint32_t camera_count)
+{
+    int started = 0;
+    for (; started < static_cast<int>(camera_count); ++started) {
+        const int result = capture_backend_start_stream(capture, started);
+        if (result == CAPTURE_BACKEND_OK)
+            continue;
+        std::cerr << "CAPTURE_AUTOSTART_FAILED camera_id=" << started
+                  << " code=" << result << " reason=\""
+                  << capture_backend_strerror(result) << "\"\n";
+        for (int camera_id = 0; camera_id < started; ++camera_id)
+            capture_backend_stop_stream(capture, camera_id);
+        return false;
+    }
+    std::cout << "CAPTURE_AUTOSTART_READY cameras=" << camera_count << '\n';
+    return true;
+}
+
+bool autostart_http_outputs(capture_backend_t *capture,
+                            camera_net_backend_t *net)
+{
+    int captures_started = 0;
+    for (int camera_id = 0; camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+         ++camera_id) {
+        const int result = capture_backend_start_stream(capture, camera_id);
+        if (result != CAPTURE_BACKEND_OK) {
+            std::cerr << "HTTP_AUTOSTART_FAILED stage=capture camera_id="
+                      << camera_id << " code=" << result << " reason=\""
+                      << capture_backend_strerror(result) << "\"\n";
+            for (int started = 0; started < captures_started; ++started)
+                capture_backend_stop_stream(capture, started);
+            return false;
+        }
+        captures_started++;
+    }
+
+    int networks_started = 0;
+    for (int camera_id = 0; camera_id < CAMERA_NET_CAMERA_COUNT;
+         ++camera_id) {
+        const int result = camera_net_start(net, camera_id);
+        if (result != CAMERA_NET_OK) {
+            std::cerr << "HTTP_AUTOSTART_FAILED stage=network camera_id="
+                      << camera_id << " code=" << result << " reason=\""
+                      << camera_net_strerror(result) << "\"\n";
+            for (int started = 0; started < networks_started; ++started)
+                camera_net_stop_camera(net, started);
+            for (int started = 0; started < captures_started; ++started)
+                capture_backend_stop_stream(capture, started);
+            return false;
+        }
+        networks_started++;
+    }
+    std::cout << "HTTP_AUTOSTART_READY cam0=http://<board-ip>:8080/cam0"
+              << " cam1=http://<board-ip>:8080/cam1"
+              << " index=http://<board-ip>:8080/\n";
+    return true;
+}
+
+bool autostart_uvc_output(capture_backend_t *capture,
+                          camera_uvc_backend_t *uvc,
+                          xvs_uart_controller_t *xvs,
+                          uint32_t xvs_frequency_hz,
+                          uint32_t xvs_low_pulse_us)
+{
+    int started = 0;
+    for (; started < CAMERA_UVC_CAMERA_COUNT; ++started) {
+        const int result = capture_backend_start_stream(capture, started);
+        if (result != CAPTURE_BACKEND_OK) {
+            std::cerr << "UVC_AUTOSTART_FAILED stage=capture camera_id="
+                      << started << " code=" << result << " reason=\""
+                      << capture_backend_strerror(result) << "\"\n";
+            while (started > 0)
+                capture_backend_stop_stream(capture, --started);
+            return false;
+        }
+    }
+
+    bool xvs_started = false;
+    if (xvs_frequency_hz) {
+        const int sync_result =
+            xvs_uart_start(xvs, xvs_frequency_hz, xvs_low_pulse_us);
+        if (sync_result != XVS_UART_OK) {
+            std::cerr << "UVC_AUTOSTART_FAILED stage=xvs code="
+                      << sync_result << " reason=\""
+                      << xvs_uart_strerror(sync_result) << "\"\n";
+            for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT;
+                 ++camera_id)
+                capture_backend_stop_stream(capture, camera_id);
+            return false;
+        }
+        xvs_started = true;
+        std::cout << "XVS_AUTOSTART_READY frequency_hz="
+                  << xvs_frequency_hz
+                  << " low_pulse_us=" << xvs_low_pulse_us << '\n';
+    }
+
+    const int result = camera_uvc_start_all(uvc);
+    if (result != CAMERA_UVC_OK) {
+        std::cerr << "UVC_AUTOSTART_FAILED stage=uvc target=all code="
+                  << result << " reason=\""
+                  << camera_uvc_strerror(result) << "\"\n";
+        if (xvs_started)
+            xvs_uart_stop(xvs);
+        for (int camera_id = 0; camera_id < CAMERA_UVC_CAMERA_COUNT;
+             ++camera_id)
+            capture_backend_stop_stream(capture, camera_id);
+        return false;
+    }
+
+    std::cout << "UVC_AUTOSTART_READY cameras=0,1"
+              << " outputs=2 mode=4000x3000@2-or-4fps/MJPEG\n";
+    return true;
+}
+
+bool autostart_all_outputs(capture_backend_t *capture,
+                           camera_net_backend_t *net,
+                           camera_uvc_backend_t *uvc,
+                           xvs_uart_controller_t *xvs,
+                           uint32_t xvs_frequency_hz,
+                           uint32_t xvs_low_pulse_us)
+{
+    int captures_started = 0;
+    for (int camera_id = 0; camera_id < CAPTURE_BACKEND_CAMERA_COUNT;
+         ++camera_id) {
+        const int result = capture_backend_start_stream(capture, camera_id);
+        if (result != CAPTURE_BACKEND_OK) {
+            std::cerr << "ALL_AUTOSTART_FAILED stage=capture camera_id="
+                      << camera_id << " code=" << result << " reason=\""
+                      << capture_backend_strerror(result) << "\"\n";
+            for (int started = 0; started < captures_started; ++started)
+                capture_backend_stop_stream(capture, started);
+            return false;
+        }
+        captures_started++;
+    }
+
+    bool xvs_started = false;
+    if (xvs_frequency_hz) {
+        const int result =
+            xvs_uart_start(xvs, xvs_frequency_hz, xvs_low_pulse_us);
+        if (result != XVS_UART_OK) {
+            std::cerr << "ALL_AUTOSTART_FAILED stage=xvs code=" << result
+                      << " reason=\"" << xvs_uart_strerror(result)
+                      << "\"\n";
+            for (int camera_id = 0; camera_id < captures_started; ++camera_id)
+                capture_backend_stop_stream(capture, camera_id);
+            return false;
+        }
+        xvs_started = true;
+        std::cout << "XVS_AUTOSTART_READY frequency_hz="
+                  << xvs_frequency_hz
+                  << " low_pulse_us=" << xvs_low_pulse_us << '\n';
+    }
+
+    int networks_started = 0;
+    for (int camera_id = 0; camera_id < CAMERA_NET_CAMERA_COUNT;
+         ++camera_id) {
+        const int result = camera_net_start(net, camera_id);
+        if (result != CAMERA_NET_OK) {
+            std::cerr << "ALL_AUTOSTART_FAILED stage=network camera_id="
+                      << camera_id << " code=" << result << " reason=\""
+                      << camera_net_strerror(result) << "\"\n";
+            for (int started = 0; started < networks_started; ++started)
+                camera_net_stop_camera(net, started);
+            if (xvs_started)
+                xvs_uart_stop(xvs);
+            for (int camera_id = 0; camera_id < captures_started; ++camera_id)
+                capture_backend_stop_stream(capture, camera_id);
+            return false;
+        }
+        networks_started++;
+    }
+
+    const int result = camera_uvc_start_all(uvc);
+    if (result != CAMERA_UVC_OK) {
+        std::cerr << "ALL_AUTOSTART_FAILED stage=uvc target=all code="
+                  << result << " reason=\"" << camera_uvc_strerror(result)
+                  << "\"\n";
+        for (int camera_id = 0; camera_id < networks_started; ++camera_id)
+            camera_net_stop_camera(net, camera_id);
+        if (xvs_started)
+            xvs_uart_stop(xvs);
+        for (int camera_id = 0; camera_id < captures_started; ++camera_id)
+            capture_backend_stop_stream(capture, camera_id);
+        return false;
+    }
+
+    std::cout << "ALL_AUTOSTART_READY cameras=0,1"
+              << " uvc=4000x3000@2-or-4fps/MJPEG"
+              << " http=http://<board-ip>:8080/{cam0,cam1}"
+              << " rndis=lifecycle-owned-by-usbdevice.service\n";
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char **argv)
+{
+    camera_backend_config_t config = {};
+    camera_backend_default_config(&config);
+    capture_backend_config_t capture_config = {};
+    capture_backend_default_config(&capture_config);
+    time_sync_config_t time_sync_config = {};
+    time_sync_default_config(&time_sync_config);
+    gnss_time_source_config_t gnss_time_config = {};
+    gnss_time_source_default_config(&gnss_time_config);
+    std::string iq_dirs[CAMERA_BACKEND_CAMERA_COUNT];
+    std::string expected_sensors[CAMERA_BACKEND_CAMERA_COUNT];
+    std::string params_devices[CAMERA_BACKEND_CAMERA_COUNT];
+    std::string sensor_devices[CAMERA_BACKEND_CAMERA_COUNT];
+    std::string video_devices[CAPTURE_BACKEND_CAMERA_COUNT];
+    uint32_t camera_count = CAMERA_BACKEND_CAMERA_COUNT;
+    bool autostart = false;
+    bool capture_autostart = false;
+    bool uvc_autostart = false;
+    bool all_outputs_autostart = false;
+    bool daemon_mode = false;
+    bool sync_protocol_self_test = false;
+    bool sync_bind_self_test = false;
+    bool photo_exif_self_test = false;
+    bool control_uart_protocol_self_test = false;
+    bool xdas_protocol_self_test = false;
+    bool gnss_time_self_test = false;
+    bool gnss_monitor = false;
+    bool stitch_autostart = false;
+    bool xvs_slave_enabled = false;
+    uint32_t xvs_autostart_hz = 0;
+    uint32_t xvs_low_pulse_us = 10;
+    std::string unified_uart_device;
+    std::string sync_uart_device;
+    std::string control_uart_device;
+    std::string xdas_uart_device;
+    std::string xdas_stitch_host;
+    uint32_t xdas_stitch_port = 46000;
+    std::string gnss_uart_device;
+    std::string pps_device;
+    xdas_camera_service::config xdas_service_config;
+
+    for (int index = 1; index < argc; ++index) {
+        std::string option = argv[index];
+        if (option == "--help") {
+            print_usage(argv[0]);
+            print_commands();
+            return EXIT_SUCCESS;
+        }
+        if (option == "--autostart") {
+            autostart = true;
+            continue;
+        }
+        if (option == "--daemon") {
+            autostart = true;
+            daemon_mode = true;
+            continue;
+        }
+        if (option == "--capture-daemon") {
+            capture_autostart = true;
+            daemon_mode = true;
+            continue;
+        }
+        if (option == "--uvc-daemon") {
+            uvc_autostart = true;
+            daemon_mode = true;
+            continue;
+        }
+        if (option == "--all-daemon") {
+            all_outputs_autostart = true;
+            daemon_mode = true;
+            continue;
+        }
+        if (option == "--sync-protocol-self-test") {
+            sync_protocol_self_test = true;
+            continue;
+        }
+        if (option == "--sync-bind-self-test") {
+            sync_bind_self_test = true;
+            continue;
+        }
+        if (option == "--photo-exif-self-test") {
+            photo_exif_self_test = true;
+            continue;
+        }
+        if (option == "--control-uart-protocol-self-test") {
+            control_uart_protocol_self_test = true;
+            continue;
+        }
+        if (option == "--xdas-protocol-self-test") {
+            xdas_protocol_self_test = true;
+            continue;
+        }
+        if (option == "--gnss-time-self-test") {
+            gnss_time_self_test = true;
+            continue;
+        }
+        if (option == "--gnss-monitor") {
+            gnss_monitor = true;
+            continue;
+        }
+        if (option == "--stitch-autostart") {
+            stitch_autostart = true;
+            continue;
+        }
+        if (option == "--xvs-slave") {
+            xvs_slave_enabled = true;
+            continue;
+        }
+        if (index + 1 >= argc) {
+            std::cerr << "Missing value for " << option << '\n';
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+
+        std::string value = argv[++index];
+        if (option == "--camera-count") {
+            if (!parse_u32(value, &camera_count) || camera_count == 0 ||
+                camera_count > CAMERA_BACKEND_CAMERA_COUNT) {
+                std::cerr << "Invalid camera count: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--width") {
+            if (!parse_u32(value, &config.width) || config.width == 0) {
+                std::cerr << "Invalid width: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--height") {
+            if (!parse_u32(value, &config.height) || config.height == 0) {
+                std::cerr << "Invalid height: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--iq0" || option == "--iq1") {
+            int camera_id = option == "--iq0" ? 0 : 1;
+            iq_dirs[camera_id] = value;
+            config.iq_dir[camera_id] = iq_dirs[camera_id].c_str();
+        } else if (option == "--params0" || option == "--params1") {
+            int camera_id = option == "--params0" ? 0 : 1;
+            params_devices[camera_id] = value;
+            config.params_device[camera_id] = params_devices[camera_id].c_str();
+        } else if (option == "--subdev0" || option == "--subdev1") {
+            int camera_id = option == "--subdev0" ? 0 : 1;
+            sensor_devices[camera_id] = value;
+            config.sensor_device[camera_id] =
+                sensor_devices[camera_id].c_str();
+        } else if (option == "--video0" || option == "--video1") {
+            int camera_id = option == "--video0" ? 0 : 1;
+            video_devices[camera_id] = value;
+            capture_config.video_device[camera_id] =
+                video_devices[camera_id].c_str();
+        } else if (option == "--sensor0" || option == "--sensor1") {
+            int camera_id = option == "--sensor0" ? 0 : 1;
+            expected_sensors[camera_id] = value;
+            config.expected_sensor[camera_id] =
+                expected_sensors[camera_id].c_str();
+        } else if (option == "--uart") {
+            unified_uart_device = value;
+        } else if (option == "--sync-uart") {
+            sync_uart_device = value;
+        } else if (option == "--sync-timer-hz") {
+            if (!parse_u64(value, &time_sync_config.timer_frequency_hz) ||
+                !time_sync_config.timer_frequency_hz ||
+                time_sync_config.timer_frequency_hz > 1000000000ULL) {
+                std::cerr << "Invalid MCU timer frequency: " << value
+                          << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--gnss-uart") {
+            gnss_uart_device = value;
+        } else if (option == "--gnss-baud") {
+            if (!parse_u32(value, &gnss_time_config.uart_baud)) {
+                std::cerr << "Invalid GNSS UART baud: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--pps-device") {
+            pps_device = value;
+        } else if (option == "--gnss-rmc-delay-ms") {
+            if (!parse_u32(value, &gnss_time_config.max_rmc_delay_ms) ||
+                !gnss_time_config.max_rmc_delay_ms ||
+                gnss_time_config.max_rmc_delay_ms > 5000) {
+                std::cerr << "Invalid GNSS RMC delay: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--xvs-autostart-hz") {
+            if (!parse_u32(value, &xvs_autostart_hz) ||
+                xvs_autostart_hz != 4) {
+                std::cerr << "Invalid XVS autostart frequency: " << value
+                          << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--xvs-low-pulse-us") {
+            if (!parse_u32(value, &xvs_low_pulse_us) ||
+                !xvs_low_pulse_us || xvs_low_pulse_us > 1000) {
+                std::cerr << "Invalid XVS low pulse width: " << value << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--control-uart") {
+            control_uart_device = value;
+        } else if (option == "--xdas-uart") {
+            xdas_uart_device = value;
+        } else if (option == "--xdas-save-root") {
+            xdas_service_config.save_root = value;
+        } else if (option == "--xdas-stitch-host") {
+            xdas_stitch_host = value;
+        } else if (option == "--xdas-stitch-port") {
+            if (!parse_u32(value, &xdas_stitch_port) || !xdas_stitch_port ||
+                xdas_stitch_port > UINT16_MAX) {
+                std::cerr << "Invalid xdas stitch receiver port: " << value
+                          << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (option == "--xdas-version") {
+            xdas_service_config.version = value;
+        } else {
+            std::cerr << "Unknown option: " << option << '\n';
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    config.camera_count = camera_count;
+    capture_config.camera_count = camera_count;
+    xdas_service_config.camera_count =
+        static_cast<std::uint8_t>(camera_count);
+    const bool direct_gnss_enabled =
+        !gnss_uart_device.empty() || !pps_device.empty();
+    if (direct_gnss_enabled &&
+        (gnss_uart_device.empty() || pps_device.empty())) {
+        std::cerr << "GNSS_CONFIGURATION_FAILED reason=\"--gnss-uart and "
+                     "--pps-device must be provided together\"\n";
+        return EXIT_FAILURE;
+    }
+    /* When GNSS and XDAS share one UART device, a unified dispatcher is
+       used: the XDAS reader owns the port, and every non-AA byte stream
+       (GNSS NMEA lines) is forwarded to the GNSS time source through
+       gnss_time_source_inject_nmea(). */
+    const bool shared_xdas_gnss = direct_gnss_enabled &&
+                                  !xdas_uart_device.empty() &&
+                                  gnss_uart_device == xdas_uart_device;
+    if (direct_gnss_enabled && !sync_uart_device.empty() &&
+        gnss_uart_device == sync_uart_device) {
+        std::cerr << "GNSS_CONFIGURATION_FAILED reason=\"GNSS input and MCU "
+                     "sync require different UART devices\"\n";
+        return EXIT_FAILURE;
+    }
+    if (direct_gnss_enabled) {
+        /* In the shared XDAS+GNSS mode the XDAS reader owns the port and
+           feeds the NMEA lines in; the GNSS module only runs its PPS
+           worker (uart_device left empty = feed-only mode). */
+        gnss_time_config.uart_device =
+            shared_xdas_gnss ? "" : gnss_uart_device.c_str();
+        gnss_time_config.pps_device = pps_device.c_str();
+        time_sync_config.timer_frequency_hz = 1000000000ULL;
+    }
+
+    if (!unified_uart_device.empty()) {
+        if ((!sync_uart_device.empty() &&
+             sync_uart_device != unified_uart_device) ||
+            (!control_uart_device.empty() &&
+             control_uart_device != unified_uart_device)) {
+            std::cerr << "UART_CONFIGURATION_FAILED reason=\"--uart cannot "
+                         "be combined with a different legacy UART device\"\n";
+            return EXIT_FAILURE;
+        }
+        sync_uart_device = unified_uart_device;
+        control_uart_device = unified_uart_device;
+    }
+    if (direct_gnss_enabled &&
+        (gnss_uart_device == sync_uart_device ||
+         gnss_uart_device == control_uart_device)) {
+        std::cerr << "GNSS_CONFIGURATION_FAILED reason=\"GNSS input and MCU "
+                     "or camera control require different UART devices\"\n";
+        return EXIT_FAILURE;
+    }
+    const bool shared_uart = !sync_uart_device.empty() &&
+                             sync_uart_device == control_uart_device;
+    if (!xdas_uart_device.empty() && !control_uart_device.empty()) {
+        std::cerr << "UART_CONFIGURATION_FAILED reason=\"--xdas-uart cannot "
+                     "be combined with --uart or --control-uart\"\n";
+        return EXIT_FAILURE;
+    }
+    if (!xdas_uart_device.empty() &&
+        xdas_uart_device == sync_uart_device) {
+        std::cerr << "UART_CONFIGURATION_FAILED reason=\"xdas camera control "
+                     "and MCU sync require different UART devices\"\n";
+        return EXIT_FAILURE;
+    }
+    if (!xdas_stitch_host.empty() &&
+        (xdas_uart_device.empty() || camera_count != 2U)) {
+        std::cerr << "XDAS_CONFIGURATION_FAILED reason=\"--xdas-stitch-host "
+                     "requires --xdas-uart and --camera-count 2\"\n";
+        return EXIT_FAILURE;
+    }
+    if (xdas_service_config.save_root.empty() ||
+        xdas_service_config.save_root[0] != '/') {
+        std::cerr << "XDAS_CONFIGURATION_FAILED reason=\"--xdas-save-root "
+                     "must be an absolute path\"\n";
+        return EXIT_FAILURE;
+    }
+    if (xdas_service_config.version.empty() ||
+        xdas_service_config.version.size() > 200U) {
+        std::cerr << "XDAS_CONFIGURATION_FAILED reason=\"--xdas-version must "
+                     "contain 1 to 200 bytes\"\n";
+        return EXIT_FAILURE;
+    }
+    if (xvs_autostart_hz && sync_uart_device.empty()) {
+        std::cerr << "XVS_AUTOSTART_CONFIGURATION_FAILED reason=\""
+                     "--xvs-autostart-hz requires --uart or --sync-uart\"\n";
+        return EXIT_FAILURE;
+    }
+    if (xvs_autostart_hz && !uvc_autostart && !all_outputs_autostart) {
+        std::cerr << "XVS_AUTOSTART_CONFIGURATION_FAILED reason=\""
+                     "--xvs-autostart-hz requires --uvc-daemon or "
+                     "--all-daemon\"\n";
+        return EXIT_FAILURE;
+    }
+
+    if (gnss_time_self_test) {
+        char report[256] = {};
+        const int gnss_result =
+            gnss_time_source_self_test(report, sizeof(report));
+        if (gnss_result != GNSS_TIME_OK) {
+            std::cerr << "GNSS_TIME_SELF_TEST_FAILED code=" << gnss_result
+                      << " reason=\"" << gnss_time_source_strerror(gnss_result)
+                      << "\" detail=\"" << report << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "GNSS_TIME_SELF_TEST_OK detail=\"" << report
+                  << "\"\n";
+        return EXIT_SUCCESS;
+    }
+    if (gnss_monitor) {
+        if (!direct_gnss_enabled) {
+            std::cerr << "GNSS_MONITOR_CONFIGURATION_FAILED reason=\"provide "
+                         "--gnss-uart and --pps-device\"\n";
+            return EXIT_FAILURE;
+        }
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
+        time_sync_service_t *monitor_time_sync = nullptr;
+        int monitor_result =
+            time_sync_create(&time_sync_config, &monitor_time_sync);
+        gnss_time_source_t *monitor_source = nullptr;
+        if (monitor_result == TIME_SYNC_OK)
+            monitor_result = gnss_time_source_create(
+                &gnss_time_config, monitor_time_sync, &monitor_source);
+        if (monitor_result == GNSS_TIME_OK)
+            monitor_result = gnss_time_source_start(monitor_source);
+        if (monitor_result != GNSS_TIME_OK) {
+            std::cerr << "GNSS_MONITOR_START_FAILED code=" << monitor_result
+                      << " reason=\""
+                      << gnss_time_source_strerror(monitor_result) << "\"\n";
+            gnss_time_source_destroy(monitor_source);
+            time_sync_destroy(monitor_time_sync);
+            return EXIT_FAILURE;
+        }
+        std::cout << "GNSS_MONITOR_READY cmos_trigger=0 system_clock_step=0\n";
+        while (!g_stop) {
+            print_time_sync_status(monitor_time_sync, monitor_source);
+            for (int part = 0; part < 10 && !g_stop; ++part)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        gnss_time_source_destroy(monitor_source);
+        time_sync_destroy(monitor_time_sync);
+        return EXIT_SUCCESS;
+    }
+    if (sync_protocol_self_test) {
+        const int protocol_result = xvs_uart_protocol_self_test();
+        if (protocol_result != XVS_UART_OK) {
+            std::cerr << "XVS_PROTOCOL_SELF_TEST_FAILED code="
+                      << protocol_result << " reason=\""
+                      << xvs_uart_strerror(protocol_result) << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "XVS_PROTOCOL_SELF_TEST_OK\n";
+        return EXIT_SUCCESS;
+    }
+    if (sync_bind_self_test) {
+        return run_trigger_binding_self_test() ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (photo_exif_self_test) {
+        std::string report;
+        const int photo_result = camera_photo::self_test(&report);
+        if (photo_result != camera_photo::EXIF_OK) {
+            std::cerr << "PHOTO_EXIF_SELF_TEST_FAILED code=" << photo_result
+                      << " reason=\"" << report << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "PHOTO_EXIF_SELF_TEST_OK detail=\"" << report
+                  << "\"\n";
+        return EXIT_SUCCESS;
+    }
+    if (control_uart_protocol_self_test) {
+        std::string report;
+        const int uart_result =
+            camera_control_uart::protocol_self_test(&report);
+        if (uart_result != camera_control_uart::OK) {
+            std::cerr << "CONTROL_UART_PROTOCOL_SELF_TEST_FAILED code="
+                      << uart_result << " reason=\"" << report << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "CONTROL_UART_PROTOCOL_SELF_TEST_OK detail=\""
+                  << report << "\"\n";
+        return EXIT_SUCCESS;
+    }
+    if (xdas_protocol_self_test) {
+        std::string protocol_report;
+        int uart_result =
+            xdas_camera_protocol::protocol_self_test(&protocol_report);
+        if (uart_result == xdas_camera_protocol::OK)
+            uart_result = xdas_camera_service::self_test(&protocol_report);
+        if (uart_result != xdas_camera_protocol::OK) {
+            std::cerr << "XDAS_PROTOCOL_SELF_TEST_FAILED code=" << uart_result
+                      << " reason=\"" << protocol_report << "\"\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "XDAS_PROTOCOL_SELF_TEST_OK detail=\""
+                  << protocol_report << "\"\n";
+        return EXIT_SUCCESS;
+    }
+
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGPIPE, SIG_IGN);
+
+    capture_config.width = config.width;
+    capture_config.height = config.height;
+
+    camera_backend_t *backend = nullptr;
+    int result = camera_backend_create(&config, &backend);
+    if (result != CAMERA_BACKEND_OK) {
+        std::cerr << "CAMERA_BACKEND_START_FAILED code=" << result
+                  << " reason=\"" << camera_backend_strerror(result) << "\"\n";
+        return EXIT_FAILURE;
+    }
+
+    capture_backend_t *capture = nullptr;
+    result = capture_backend_create(&capture_config, &capture);
+    if (result != CAPTURE_BACKEND_OK) {
+        std::cerr << "CAPTURE_BACKEND_START_FAILED code=" << result
+                  << " reason=\"" << capture_backend_strerror(result)
+                  << "\"\n";
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    camera_uvc_config_t uvc_config = {};
+    camera_uvc_default_config(&uvc_config);
+    camera_uvc_backend_t *uvc = nullptr;
+    result = camera_uvc_create(&uvc_config, &uvc);
+    if (result != CAMERA_UVC_OK) {
+        std::cerr << "UVC_BACKEND_START_FAILED code=" << result
+                  << " reason=\"" << camera_uvc_strerror(result) << "\"\n";
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    camera_net_config_t net_config = {};
+    camera_net_default_config(&net_config);
+    camera_net_backend_t *net = nullptr;
+    result = camera_net_create(&net_config, &net);
+    if (result != CAMERA_NET_OK) {
+        std::cerr << "NET_BACKEND_START_FAILED code=" << result
+                  << " reason=\"" << camera_net_strerror(result) << "\"\n";
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    camera_photo_config_t photo_config = {};
+    camera_photo_default_config(&photo_config);
+    photo_config.width = config.width;
+    photo_config.height = config.height;
+    photo_config.camera_count = camera_count;
+    camera_photo_backend_t *photo = nullptr;
+    result = camera_photo_create(&photo_config, &photo);
+    if (result != CAMERA_PHOTO_OK) {
+        std::cerr << "PHOTO_BACKEND_START_FAILED code=" << result
+                  << " reason=\"" << camera_photo_strerror(result) << "\"\n";
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    output_backends outputs = {uvc, net, backend, capture, nullptr, photo};
+    int callback_camera_id = 0;
+    for (; callback_camera_id < static_cast<int>(camera_count);
+         ++callback_camera_id) {
+        result = capture_backend_set_frame_callback(
+            capture, callback_camera_id, capture_to_outputs, &outputs);
+        if (result != CAPTURE_BACKEND_OK)
+            break;
+    }
+    if (callback_camera_id != static_cast<int>(camera_count)) {
+        std::cerr << "OUTPUT_CAPTURE_CALLBACK_FAILED camera_id="
+                  << callback_camera_id << " code=" << result
+                  << " reason=\"" << capture_backend_strerror(result)
+                  << "\"\n";
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    trigger_frame_binder_config_t binder_config = {};
+    trigger_frame_binder_default_config(&binder_config);
+    trigger_frame_binder_t *binder = nullptr;
+    result = trigger_frame_binder_create(&binder_config, &binder);
+    if (result != TRIGGER_FRAME_BINDER_OK) {
+        std::cerr << "TRIGGER_BINDER_START_FAILED code=" << result
+                  << " reason=\"" << trigger_frame_binder_strerror(result)
+                  << "\"\n";
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    time_sync_service_t *time_sync = nullptr;
+    result = time_sync_create(&time_sync_config, &time_sync);
+    if (result != TIME_SYNC_OK) {
+        std::cerr << "TIME_SYNC_START_FAILED code=" << result
+                  << " reason=\"" << time_sync_strerror(result) << "\"\n";
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    trigger_simulator_t *simulator = nullptr;
+    result = trigger_simulator_create(simulator_to_trigger_binder, binder,
+                                      &simulator);
+    if (result != TRIGGER_SIMULATOR_OK) {
+        std::cerr << "TRIGGER_SIMULATOR_START_FAILED code=" << result
+                  << " reason=\"" << trigger_simulator_strerror(result)
+                  << "\"\n";
+        time_sync_destroy(time_sync);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+    outputs.binder = binder;
+
+    int event_callback_camera_id = 0;
+    for (; event_callback_camera_id < static_cast<int>(camera_count);
+         ++event_callback_camera_id) {
+        result = capture_backend_set_frame_event_callback(
+            capture, event_callback_camera_id, capture_to_trigger_binder,
+            binder);
+        if (result != CAPTURE_BACKEND_OK)
+            break;
+    }
+    if (event_callback_camera_id != static_cast<int>(camera_count)) {
+        std::cerr << "TRIGGER_CAPTURE_CALLBACK_FAILED camera_id="
+                  << event_callback_camera_id << " code=" << result
+                  << " reason=\"" << capture_backend_strerror(result)
+                  << "\"\n";
+        trigger_simulator_destroy(simulator);
+        time_sync_destroy(time_sync);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    gnss_time_source_t *gnss_time = nullptr;
+    if (direct_gnss_enabled) {
+        result = gnss_time_source_create(&gnss_time_config, time_sync,
+                                         &gnss_time);
+        if (result == GNSS_TIME_OK)
+            result = gnss_time_source_start(gnss_time);
+        if (result != GNSS_TIME_OK) {
+            std::cerr << "GNSS_TIME_START_FAILED code=" << result
+                      << " reason=\"" << gnss_time_source_strerror(result)
+                      << "\"\n";
+            gnss_time_source_destroy(gnss_time);
+            trigger_simulator_destroy(simulator);
+            time_sync_destroy(time_sync);
+            trigger_frame_binder_destroy(binder);
+            camera_photo_destroy(photo);
+            camera_net_destroy(net);
+            camera_uvc_destroy(uvc);
+            capture_backend_destroy(capture);
+            camera_backend_destroy(backend);
+            return EXIT_FAILURE;
+        }
+        outputs.gnss_time = gnss_time;
+        std::cout << "GNSS_TIME_READY uart=\"" << gnss_uart_device
+                  << "\" baud=" << gnss_time_config.uart_baud
+                  << " pps_device=\"" << pps_device
+                  << "\" mode=APPLICATION_TIMESTAMP_ONLY"
+                  << " cmos_trigger=0 system_clock_step=0\n";
+    }
+
+    xvs_event_context xvs_events;
+    xvs_events.time_sync = time_sync;
+    xvs_events.gnss_time = gnss_time;
+    xvs_events.binder = binder;
+    unified_uart_control_context unified_control;
+    unified_control.backend = backend;
+    unified_control.capture = capture;
+    unified_control.uvc = uvc;
+    unified_control.net = net;
+    unified_control.photo = photo;
+    unified_control.time_sync = time_sync;
+    unified_control.gnss_time = gnss_time;
+    unified_control.binder = binder;
+    unified_control.simulator = simulator;
+    xvs_uart_controller_t *xvs = nullptr;
+    if (!sync_uart_device.empty()) {
+        result = xvs_uart_create(sync_uart_device.c_str(), &xvs);
+        unified_control.xvs = xvs;
+        if (result == XVS_UART_OK)
+            result = xvs_uart_set_event_callback(
+                xvs, xvs_event_to_time_and_frame, &xvs_events);
+        if (result == XVS_UART_OK && shared_uart)
+            result = xvs_uart_set_control_callback(
+                xvs, process_unified_uart_control, &unified_control);
+        if (result == XVS_UART_OK)
+            result = xvs_uart_ping(xvs);
+        if (result == XVS_UART_OK)
+            result = xvs_uart_idle(xvs);
+        if (result != XVS_UART_OK) {
+            std::cerr << "XVS_UART_START_FAILED device=\""
+                      << sync_uart_device << "\" code=" << result
+                      << " reason=\"" << xvs_uart_strerror(result)
+                      << "\"\n";
+            xvs_uart_destroy(xvs);
+            trigger_simulator_destroy(simulator);
+            gnss_time_source_destroy(gnss_time);
+            time_sync_destroy(time_sync);
+            trigger_frame_binder_destroy(binder);
+            camera_photo_destroy(photo);
+            camera_net_destroy(net);
+            camera_uvc_destroy(uvc);
+            capture_backend_destroy(capture);
+            camera_backend_destroy(backend);
+            return EXIT_FAILURE;
+        }
+        std::cout << "XVS_UART_READY device=\"" << sync_uart_device
+                  << "\" baud=115200 format=8N1 output_state=IDLE_HIGH"
+                  << " timer_frequency_hz="
+                  << time_sync_config.timer_frequency_hz << '\n';
+        if (shared_uart) {
+            std::cout << "UART_MUX_READY device=\"" << sync_uart_device
+                      << "\" baud=115200 format=8N1"
+                      << " routes=CAM,XVS_ACK,PPS_NMEA_TRIGGER\n";
+        }
+    }
+
+    std::cout << "CAMERA_BACKEND_READY cameras=" << camera_count
+              << " uvc=cam0,cam1:4000x3000@2-or-4fps/MJPEG"
+              << " net=4000x3000/MJPEG source_rate=per-camera:2-or-4fps"
+              << " HTTP=:8080/{cam0,cam1} sources=camera0,camera1\n";
+    if (!daemon_mode)
+        print_commands();
+
+    if (capture_autostart &&
+        !autostart_capture_only(capture, camera_count)) {
+        xvs_uart_destroy(xvs);
+        trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
+        time_sync_destroy(time_sync);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        capture_backend_destroy(capture);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    if (all_outputs_autostart &&
+        !autostart_all_outputs(capture, net, uvc, xvs, xvs_autostart_hz,
+                               xvs_low_pulse_us)) {
+        xvs_uart_destroy(xvs);
+        trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
+        time_sync_destroy(time_sync);
+        capture_backend_destroy(capture);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    if (autostart && !all_outputs_autostart &&
+        !autostart_http_outputs(capture, net)) {
+        xvs_uart_destroy(xvs);
+        trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
+        time_sync_destroy(time_sync);
+        capture_backend_destroy(capture);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    if (uvc_autostart && !all_outputs_autostart &&
+        !autostart_uvc_output(capture, uvc, xvs, xvs_autostart_hz,
+                              xvs_low_pulse_us)) {
+        xvs_uart_destroy(xvs);
+        trigger_simulator_destroy(simulator);
+        gnss_time_source_destroy(gnss_time);
+        time_sync_destroy(time_sync);
+        capture_backend_destroy(capture);
+        trigger_frame_binder_destroy(binder);
+        camera_photo_destroy(photo);
+        camera_net_destroy(net);
+        camera_uvc_destroy(uvc);
+        camera_backend_destroy(backend);
+        return EXIT_FAILURE;
+    }
+
+    int runtime_result = EXIT_SUCCESS;
+    const auto run_console = [&] {
+        const bool interactive = isatty(STDIN_FILENO);
+        std::string line;
+        while (!g_stop) {
+            if (interactive)
+                std::cout << "camera-aiq> " << std::flush;
+            if (!std::getline(std::cin, line))
+                break;
+            if (!execute_command(backend, capture, uvc, net, photo, xvs,
+                                 time_sync, gnss_time, binder, simulator,
+                                 line))
+                break;
+        }
+    };
+
+    xdas_camera_service::operations xdas_operations;
+    xdas_operations.capture_running = [&](uint8_t camera_id) {
+        capture_backend_status_t status = {};
+        return capture_backend_get_status(capture, camera_id, &status) ==
+                   CAPTURE_BACKEND_OK &&
+               status.running;
+    };
+    if (!xdas_stitch_host.empty()) {
+        xdas_operations.global_save_enabled = [&] {
+            camera_photo_stitch_transfer_status_t status = {};
+            return camera_photo_stitch_transfer_get_status(photo, &status) ==
+                       CAMERA_PHOTO_OK &&
+                   status.enabled;
+        };
+        xdas_operations.global_save_session_error = [&]() -> int {
+            camera_photo_stitch_transfer_status_t transfer_status = {};
+            camera_photo_stitch_status_t stitch_status = {};
+            if (camera_photo_stitch_transfer_get_status(
+                    photo, &transfer_status) != CAMERA_PHOTO_OK ||
+                camera_photo_stitch_get_status(photo, &stitch_status) !=
+                    CAMERA_PHOTO_OK) {
+                return CAMERA_PHOTO_ERR_ARGUMENT;
+            }
+            if (transfer_status.failed || transfer_status.queue_rejected ||
+                transfer_status.delete_errors || transfer_status.last_result != 0)
+                return CAMERA_PHOTO_ERR_IO;
+            return stitch_status.last_error;
+        };
+        xdas_operations.start_global_save = [&] {
+            std::string path = xdas_service_config.save_root;
+            while (path.size() > 1U && path.back() == '/')
+                path.pop_back();
+            path += "/stitch";
+            return camera_photo_stitch_transfer_start(
+                photo, path.c_str(), xdas_stitch_host.c_str(),
+                static_cast<uint16_t>(xdas_stitch_port));
+        };
+        xdas_operations.stop_global_save = [&] {
+            return camera_photo_stitch_transfer_stop(photo);
+        };
+    }
+    xdas_operations.save_enabled = [&](uint8_t camera_id) {
+        return camera_photo_is_enabled(photo, camera_id) != 0;
+    };
+    xdas_operations.save_session_error = [&](uint8_t camera_id) -> int {
+        camera_photo_status_t status = {};
+        if (camera_photo_get_status(photo, camera_id, &status) !=
+            CAMERA_PHOTO_OK)
+            return CAMERA_PHOTO_ERR_ARGUMENT;
+        return status.last_error;
+    };
+    xdas_operations.start_save =
+        [&](uint8_t camera_id, const std::string &path) {
+            return camera_photo_start(photo, camera_id, path.c_str());
+        };
+    xdas_operations.stop_save = [&](uint8_t camera_id) {
+        return camera_photo_stop(photo, camera_id);
+    };
+    xdas_operations.start_uvc = [&](int target) -> int {
+        const int first = target == xdas_camera_service::kAllCameras ? 0 : target;
+        const int count = target == xdas_camera_service::kAllCameras
+                              ? static_cast<int>(camera_count)
+                              : 1;
+        for (int offset = 0; offset < count; ++offset) {
+            capture_backend_status_t status = {};
+            if (capture_backend_get_status(capture, first + offset, &status) !=
+                    CAPTURE_BACKEND_OK ||
+                !status.running)
+                return CAMERA_UVC_ERR_STATE;
+        }
+        return target == xdas_camera_service::kAllCameras
+                   ? camera_uvc_start_all(uvc)
+                   : camera_uvc_start(uvc, target);
+    };
+    xdas_operations.schedule_reboot = []() -> int {
+        try {
+            std::thread([] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                sync();
+                if (reboot(RB_AUTOBOOT) != 0) {
+                    std::fprintf(stderr,
+                                 "XDAS_REBOOT_FAILED errno=%d reason=%s\n",
+                                 errno, std::strerror(errno));
+                }
+            }).detach();
+        } catch (...) {
+            return -1;
+        }
+        return 0;
+    };
+    xdas_operations.set_auto = [&](uint8_t camera_id) {
+        return camera_backend_set_auto(backend, camera_id);
+    };
+    xdas_operations.set_exposure_us = [&](uint8_t camera_id,
+                                           uint32_t exposure_us) {
+        return camera_backend_set_exposure(backend, camera_id, exposure_us);
+    };
+    xdas_operations.set_iso = [&](uint8_t camera_id, uint32_t iso) {
+        return camera_backend_set_iso(backend, camera_id, iso);
+    };
+    xdas_operations.get_max_exposure_us =
+        [&](uint8_t camera_id, uint32_t *max_exposure_us) {
+            return camera_backend_get_max_exposure(
+                backend, camera_id, max_exposure_us);
+        };
+    xdas_operations.set_max_exposure_us =
+        [&](uint8_t camera_id, uint32_t max_exposure_us) {
+            return camera_backend_set_max_exposure(
+                backend, camera_id, max_exposure_us);
+        };
+    xdas_operations.capacity_mb = [&](uint32_t *free_mb,
+                                      uint32_t *total_mb) {
+        return filesystem_capacity_mb(xdas_service_config.save_root, free_mb,
+                                      total_mb);
+    };
+    xdas_operations.realtime_us = [&]() -> uint64_t {
+        if (gnss_time) {
+            const uint64_t now_ns = monotonic_ns();
+            time_sync_resolution_t resolution = {};
+            if (now_ns && gnss_time_source_resolve_monotonic_ns(
+                              gnss_time, now_ns, &resolution) == GNSS_TIME_OK &&
+                resolution.valid) {
+                return resolution.utc_ns / 1000ULL;
+            }
+        }
+        return realtime_us();
+    };
+    xdas_operations.set_realtime_us = [&](uint64_t timestamp_us) {
+        if (camera_photo_stitch_is_enabled(photo))
+            return -1;
+        for (int camera_id = 0; camera_id < static_cast<int>(camera_count);
+             ++camera_id) {
+            if (camera_photo_is_enabled(photo, camera_id))
+                return -1;
+        }
+        struct timespec value = {};
+        const uint64_t seconds = timestamp_us / 1000000ULL;
+        value.tv_sec = static_cast<time_t>(seconds);
+        if (value.tv_sec < 0 || static_cast<uint64_t>(value.tv_sec) != seconds)
+            return -1;
+        value.tv_nsec = static_cast<long>((timestamp_us % 1000000ULL) * 1000ULL);
+        return clock_settime(CLOCK_REALTIME, &value);
+    };
+    const auto xdas_handler =
+        [&](const xdas_camera_protocol::request &request,
+            xdas_camera_protocol::reply *reply) {
+            std::lock_guard<std::mutex> lock(unified_control.command_mutex);
+            xdas_camera_service::handle_command(
+                request, reply, xdas_service_config, xdas_operations);
+            std::ostringstream message;
+            if (reply->error == xdas_camera_protocol::ERROR_NONE) {
+                message << "XDAS_COMMAND_OK cmd0=0x" << std::hex
+                        << static_cast<unsigned int>(request.command0)
+                        << " cmd1=0x"
+                        << static_cast<unsigned int>(request.command1);
+                std::cout << message.str() << '\n';
+            } else {
+                message << "XDAS_COMMAND_ERROR cmd0=0x" << std::hex
+                        << static_cast<unsigned int>(request.command0)
+                        << " cmd1=0x"
+                        << static_cast<unsigned int>(request.command1)
+                        << " error=0x"
+                        << static_cast<unsigned int>(reply->error);
+                std::cerr << message.str() << '\n';
+            }
+        };
+
+    if (!xdas_uart_device.empty()) {
+        std::cout << "XDAS_UART_READY device=\"" << xdas_uart_device
+                  << "\" baud=115200 format=8N1 protocol=XDAS_CAMERA_V2"
+                  << " save_root=\"" << xdas_service_config.save_root
+                  << "\" global_save_mode="
+                  << (xdas_stitch_host.empty() ? "PER_CAMERA" : "STITCH_NCM")
+                  << " stitch_receiver=\""
+                  << (xdas_stitch_host.empty() ? "" : xdas_stitch_host)
+                  << "\" stitch_port="
+                  << (xdas_stitch_host.empty() ? 0U : xdas_stitch_port) << '\n';
+        std::string stray_nmea_line;
+        const xdas_camera_protocol::stray_bytes_sink stray_sink =
+            [&](const std::vector<std::uint8_t> &bytes) {
+                if (!gnss_time)
+                    return;
+                for (const std::uint8_t byte : bytes) {
+                    if (byte == 0x00) {
+                        /* The XDAS reader runs in raw mode without PARMRK:
+                           a line BREAK arrives as a single 0x00 byte (NMEA
+                           and AA-frame payloads never reach this sink, so
+                           0x00 unambiguously marks the PPS edge). */
+                        struct timespec arrival = {};
+                        clock_gettime(CLOCK_MONOTONIC, &arrival);
+                        const uint64_t arrival_ns =
+                            static_cast<uint64_t>(arrival.tv_sec) *
+                                1000000000ULL +
+                            static_cast<uint64_t>(arrival.tv_nsec);
+                        struct timespec rt = {};
+                        uint64_t realtime_ns = 0;
+                        if (clock_gettime(CLOCK_REALTIME, &rt) == 0) {
+                            realtime_ns =
+                                static_cast<uint64_t>(rt.tv_sec) *
+                                    1000000000ULL +
+                                static_cast<uint64_t>(rt.tv_nsec);
+                        }
+                        /* The wrapper rejects kernel_sequence == 0, so a
+                           synthetic sequence marks this UART-break PPS. */
+                        gnss_time_source_inject_pps(gnss_time, 1,
+                                                    realtime_ns, arrival_ns);
+                        continue;
+                    }
+                    if (byte == '\n') {
+                        if (stray_nmea_line.empty())
+                            continue;
+                        while (!stray_nmea_line.empty() &&
+                               (stray_nmea_line.back() == '\r' ||
+                                stray_nmea_line.back() == '\n'))
+                            stray_nmea_line.pop_back();
+                        struct timespec arrival = {};
+                        clock_gettime(CLOCK_MONOTONIC, &arrival);
+                        const uint64_t arrival_ns =
+                            static_cast<uint64_t>(arrival.tv_sec) *
+                                1000000000ULL +
+                            static_cast<uint64_t>(arrival.tv_nsec);
+                        gnss_time_source_inject_nmea(gnss_time,
+                                                     stray_nmea_line.c_str(),
+                                                     arrival_ns);
+                        stray_nmea_line.clear();
+                    } else if (stray_nmea_line.size() < 255U) {
+                        stray_nmea_line.push_back(
+                            static_cast<char>(byte));
+                    }
+                }
+            };
+        /* Warn before taking over the port if other processes already have
+           it open: they either hold the exclusive flock (this daemon then
+           fails with ERR_BUSY) or steal bytes from the shared RX stream
+           (the historic "competing reader" frame-loss bug). */
+        const std::string xdas_other_openers =
+            list_device_openers(xdas_uart_device);
+        if (!xdas_other_openers.empty()) {
+            std::cerr << "XDAS_UART_CONTENDED device=\"" << xdas_uart_device
+                      << "\" other_openers=\"" << xdas_other_openers
+                      << "\" hint=\"stop these processes or the daemon and "
+                         "the other reader will fight over the UART\"\n";
+        }
+        /* Force the IMX586 into XVS slave mode from user space when the
+           flashed device tree lacks "sony,xvs-slave-mode".  The sensor is
+           powered and streaming by now, so the registers stick; the sensor
+           switches to the XVS-triggered cadence at the next XVS edge. */
+        if (xvs_slave_enabled) {
+            for (uint32_t camera_id = 0; camera_id < camera_count;
+                 ++camera_id) {
+                std::string report;
+                const char *bus =
+                    camera_id == 0 ? "/dev/i2c-3" : "/dev/i2c-4";
+                const bool xvs_ok = imx586_v4l2::write_xvs_slave_registers(
+                    bus, 0x1a, -1, &report);
+                std::cout << "XVS_SLAVE camera_id=" << camera_id
+                          << " result=" << (xvs_ok ? "OK" : "FAILED")
+                          << " detail=\"" << report << "\"\n";
+            }
+        }
+        /* The save-on equivalent without the UART round-trip: start the
+           stitch pipeline itself at boot when --stitch-autostart is set. */
+        if (stitch_autostart) {
+            xdas_camera_protocol::request request;
+            request.command0 = 0x01;
+            request.command1 = 0x11;
+            xdas_camera_protocol::reply reply;
+            xdas_handler(request, &reply);
+            std::cout << "STITCH_AUTOSTART result="
+                      << (reply.error == xdas_camera_protocol::ERROR_NONE
+                              ? "OK"
+                              : "FAILED")
+                      << "\n";
+        }
+        const int uart_result = xdas_camera_protocol::run(
+            xdas_uart_device, xdas_handler, [] { return g_stop != 0; },
+            shared_xdas_gnss ? stray_sink
+                             : xdas_camera_protocol::stray_bytes_sink());
+        if (uart_result != xdas_camera_protocol::OK && !g_stop) {
+            std::cerr << "XDAS_UART_FAILED device=\"" << xdas_uart_device
+                      << "\" code=" << uart_result << " reason=\""
+                      << xdas_camera_protocol::strerror(uart_result)
+                      << "\"\n";
+            if (uart_result == xdas_camera_protocol::ERR_BUSY) {
+                const std::string holders =
+                    list_device_openers(xdas_uart_device);
+                std::cerr << "XDAS_UART_BUSY_DETAIL device=\""
+                          << xdas_uart_device << "\" holders=\""
+                          << (holders.empty() ? "unknown" : holders)
+                          << "\" hint=\"another process holds the UART lock; "
+                             "kill the listed pid or run /etc/init.d/"
+                             "S60pcl-camera restart\"\n";
+            }
+            runtime_result = EXIT_FAILURE;
+        }
+    } else if (shared_uart) {
+        std::cout << "CONTROL_UART_READY device=\"" << control_uart_device
+                  << "\" baud=115200 format=8N1 protocol=CAM_V1"
+                  << " owner=UART_MUX\n";
+        if (daemon_mode) {
+            while (!g_stop)
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        } else {
+            run_console();
+        }
+    } else if (!control_uart_device.empty()) {
+        std::cout << "CONTROL_UART_READY device=\"" << control_uart_device
+                  << "\" baud=115200 format=8N1 protocol=CAM_V1\n";
+        const auto handler = [&](const std::string &command,
+                                 std::string *output) {
+            std::ostringstream capture_output;
+            std::streambuf *saved = std::cout.rdbuf(capture_output.rdbuf());
+            execute_command(backend, capture, uvc, net, photo, xvs,
+                            time_sync, gnss_time, binder, simulator, command);
+            std::cout.flush();
+            std::cout.rdbuf(saved);
+            *output = capture_output.str();
+        };
+        const int uart_result = camera_control_uart::run(
+            control_uart_device, handler, [] { return g_stop != 0; });
+        if (uart_result != camera_control_uart::OK && !g_stop) {
+            std::cerr << "CONTROL_UART_FAILED device=\""
+                      << control_uart_device << "\" code=" << uart_result
+                      << " reason=\""
+                      << camera_control_uart::strerror(uart_result)
+                      << "\"\n";
+            if (uart_result == camera_control_uart::ERR_BUSY) {
+                const std::string holders =
+                    list_device_openers(control_uart_device);
+                std::cerr << "CONTROL_UART_BUSY_DETAIL device=\""
+                          << control_uart_device << "\" holders=\""
+                          << (holders.empty() ? "unknown" : holders)
+                          << "\" hint=\"another process holds the UART lock; "
+                             "kill the listed pid\"\n";
+            }
+            runtime_result = EXIT_FAILURE;
+        }
+    } else if (daemon_mode) {
+        while (!g_stop)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    } else {
+        run_console();
+    }
+
+    if (xvs) {
+        const int stop_result = xvs_uart_stop(xvs);
+        if (stop_result != XVS_UART_OK) {
+            std::cerr << "XVS_UART_STOP_WARNING code=" << stop_result
+                      << " reason=\"" << xvs_uart_strerror(stop_result)
+                      << "\"\n";
+        }
+        xvs_uart_destroy(xvs);
+    }
+    trigger_simulator_destroy(simulator);
+    capture_backend_destroy(capture);
+    trigger_frame_binder_destroy(binder);
+    gnss_time_source_destroy(gnss_time);
+    time_sync_destroy(time_sync);
+    camera_photo_destroy(photo);
+    camera_net_destroy(net);
+    camera_uvc_destroy(uvc);
+    camera_backend_destroy(backend);
+    std::cout << "CAMERA_BACKEND_STOPPED\n";
+    return runtime_result;
+}
